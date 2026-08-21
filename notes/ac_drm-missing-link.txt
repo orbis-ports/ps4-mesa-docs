@@ -1,0 +1,13 @@
+ac_drm_device_deinitialize
+ac_drm_device_get_sync_provider
+ac_drm_get_marketing_name
+ac_drm_query_firmware_version
+ac_drm_query_gpu_info
+ac_drm_query_has_vm_always_valid
+ac_drm_query_hw_ip_count
+ac_drm_query_hw_ip_info
+ac_drm_query_info
+ac_drm_query_pci_bus_info
+ac_drm_query_sw_info
+ac_drm_query_uq_fw_area_info
+ac_drm_query_video_caps_info
