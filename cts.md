@@ -35,8 +35,15 @@ stale the way the version that used to be here did (it still pointed at `~/src/T
           -DCMAKE_TOOLCHAIN_FILE=$HOME/src-ps4/orbis-compat/cmake/ps4-openorbis.cmake \
           -DORBIS_COMPAT_DIR=$HOME/src-ps4/orbis-compat \
           -DORBIS_VKLOADER_DIR=$HOME/src-ps4/orbis-compat/vkloader \
-          -DORBIS_RADV_LIB=$HOME/src/mesa-ps4/build-orbis/src/amd/vulkan/libvulkan_radeon.a \
-          -DORBIS_MESA_INCLUDE=$HOME/src/mesa-ps4/include
+          -DORBIS_RADV_LIB=$HOME/src-ps4/mesa-ps4/build-orbis/src/amd/vulkan/libvulkan_radeon.a \
+          -DORBIS_MESA_INCLUDE=$HOME/src-ps4/mesa-ps4/include
+
+⚠ **`~/src-ps4/mesa-ps4`, NOT `~/src/mesa-ps4`.** The second is the BACKUP checkout since 2026-08-21
+and its `build-orbis` holds an older driver. This recipe named it, and both CTS build directories in
+the fork were configured against it - so a CTS run would have tested a driver from the day before
+whatever had just been changed, with nothing anywhere saying so. Check before trusting a build:
+
+    grep ORBIS_RADV_LIB build-orbis/CMakeCache.txt
 
 ⚠ `-DDE_OS=DE_OS_UNIX` cannot be moved into the target file: delibs decides before the target is
 read. `targets/orbis/orbis.cmake` refuses rather than letting it be wrong silently.
@@ -113,7 +120,7 @@ and both belong somewhere else:
     cd <cts>/build-orbis/external/vulkancts/modules/vulkan
     OO_PS4_TOOLCHAIN=~/.local/opt/openorbis ~/.local/opt/openorbis/bin/linux/create-fself \
         -in=deqp-vk -out=deqp-vk.oelf --eboot eboot.bin --paid 0x3800000000000011
-    mkdir -p pkgout && ~/src/Tempest/scripts/ps4/make-pkg.sh \
+    mkdir -p pkgout && ~/src-ps4/orbis-compat/scripts/ps4/make-pkg.sh \
         --eboot eboot.bin --out-dir pkgout --title-id TMPS10022 --title "Vulkan CTS"
 
 **107 MB**, against 48 MB for the whole game. Stripping debug information saves 0.7 MB of it, so that

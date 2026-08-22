@@ -2212,3 +2212,636 @@ attached and no `getenv` anywhere. And `mount_disk` called without the mode that
 None of the four is visible to a build, a test, or a console run. Each was found by reading one
 thing against the thing it claims to describe - and three of the four were found because the
 maintainer asked a plain question about something that looked settled.
+
+---
+
+# Handoff — the trees moved, build-support was halved, and there is a review plan to execute, 2026-08-22
+
+Written for a session whose job is to **carry out `mesa-ps4/PLAN.md`**. Everything below is either
+where things now live, or something that will otherwise be re-derived.
+
+## ⚠ Everything moved. `/home/mikolaj/src/mesa-ps4` is now a BACKUP, not the working tree
+
+    ~/src-ps4/mesa-ps4        orbis        ac2f18a9149   the driver - WORK HERE
+    ~/src-ps4/orbis-compat    master       0aab8cb       platform overlay
+    ~/src-ps4/ps4-mesa-docs   main         03b651a       this file lives here now
+    ~/src-ps4/VK-GL-CTS       ps4-support  2c6c32438     pushed
+    ~/src-ps4/Tempest         ps4-support  d4d05d2f      pushed
+    ~/src-ps4/OpenGothic      ps4-support  de1b93fe      pushed
+    ~/src-ps4/ZenKit          ps4-support  39bf134       pushed
+    ~/src-ps4/RetroArch       ps4-support  4920537011    clean; this session never touched it
+
+`/home/mikolaj/src/mesa-ps4` still holds the FULL HISTORY - 267 commits - and its own `build-orbis`.
+It was left untouched on purpose. **A whole exchange was lost this session to editing one tree and
+reading the other**, so check `pwd` before believing "nothing changed".
+
+## The driver is now one staged change set, not 267 commits
+
+`~/src-ps4/mesa-ps4` was squashed with `git add -A` then `git reset --soft main`. HEAD is upstream
+Mesa (`ac2f18a9149`); the whole port sits in the index:
+
+    73 files, +17795 / -145        41 src/amd · 15 build-support/tools · 9 src/vulkan · 3 src/util · rest
+
+⚠ **The 267 commits are reachable ONLY through `refs/backup/orbis-267-commits`** in that repo, and
+normally on the branch in the backup checkout. The upstreaming shortlist names six of them by SHA;
+they are objects without a branch now.
+
+⚠ Mesa upstreaming is **closed** - decided 2026-08-21, they will not take Orbis as a target. PLAN.md
+§8 and the "upstreamable list" above are dead text. ZenKit and OpenGothic are unaffected.
+
+## `mesa-ps4/PLAN.md` - the review plan, and what verifying three of it found
+
+Written by a separate `/code-review max` agent, 15 findings in 5 phases. It is in
+`.git/info/exclude` **line 1** - the agent excluded it before writing it, so `git status` will never
+show it and `git add -A` cannot take it. Do not "fix" that.
+
+Its line numbers were checked against the tree and they MATCH: the review ran after this session cut
+454 lines out of `ac_orbis_drm.c`.
+
+Three findings were verified by reading the code rather than trusting the report:
+
+**2.3 (`vk_drm_syncobj.c:698`) - REAL, and it is the one to do first.** `u_sync_provider.c` sets
+`.transfer = drm_syncobj_transfer` unconditionally; `drmGetCap(DRM_CAP_SYNCOBJ_TIMELINE)` gates only
+`timeline_signal` and `timeline_wait`. So on a kernel without timeline syncobj the new arm
+`(device->sync->transfer != NULL && wait_count == 1)` routes payload copies through an ioctl that is
+not there. **This is in `src/vulkan/runtime/`, shared by every Mesa Vulkan driver** - the only
+finding that damages somebody else. The fix is one term: the condition already has
+`vk_device_has_timeline_syncobj(device)` next to it.
+⚠ The code carries a long ⚠ comment defending `wait_count == 1`. It defends the transfer's SHAPE
+(many-to-many needs a real timeline). It never asks whether the ioctl exists. A comment answering a
+different question reads like a comment answering this one.
+
+**2.4 (tess factor ring) - mechanism REAL, conclusion UNVERIFIED.** Measured in the tree:
+`(192/3)*16 = 1024` B per workgroup, `num_workgroups = 256` hardcoded for LIVERPOOL/GLADIUS, so
+`tess_factor_ring_size = 262144` B = 65536 dwords = `0x10000`. The generated header says
+
+    #define S_030938_SIZE(x)  (((unsigned)(x) & 0x1FFFF) << 0)     /* 17 bits, widened for GFX11 */
+    #define C_030938_SIZE     0xFFFE0000
+
+so `assert((tf_ring_size & C_030938_SIZE) == 0)` in `ac_cmdbuf_cp.c:417` does NOT catch `0x10000`.
+That part is certain. **What is not established is the review's premise that the GFX7 hardware field
+is 16 bits** - it cites no source, and this port has already been burned by a number taken from a
+family that is not this family (`ORBIS_NUM_SE=4`, falsified on hardware). Establish the width before
+changing the count.
+⚠ And note `gfx_level >= GFX7` takes the `R_030938` path - the `R_008988` arm below it is GFX6.
+Reading that backwards costs a wrong fix.
+
+**Phase 1 is not the blocker it says it is.** The three build breaks are Linux-without-orbis,
+Windows and MSVC. Nothing here builds those, and this session built the tree four times today.
+Worth fixing for hygiene; not worth blocking on.
+
+Suggested order: **2.3 first** (it is one term and it is not ours to break), then phase 2, then the
+rest as written.
+
+The review's own stated gap: the `build-support/` finder returned nothing. That area was halved
+today, so it is cheaper to look at now than it was this morning.
+
+## What this session removed, so nothing gets restored by accident
+
+    build-support/orbis/{docs,notes}    -> ~/src-ps4/ps4-mesa-docs   (this file, PLAN, TODO, research, dumps)
+    build-support/orbis/cts/*           -> CTS fork targets/orbis/   (deqp-args, deqp-env, qpa-status.py)
+                                           and ps4-mesa-docs/cts.md
+    build-support/orbis/cross/          -> orbis-compat/cmake/orbis.ini.in
+    build-support/orbis/tools/umtxcheck.c -> orbis-compat/test/
+    build-support/orbis/title/          deleted - the OpenGothic patch-queue era, superseded by the fork
+    build-support/orbis/tools/          32 files -> 15. Deleted: stalepool, thickprobe, thick3d,
+                                        dargs.*, vidx.*, and three .spv intermediates
+    ac_orbis_drm.c                      -454 lines: orbis_probe_gnm_debugger, orbis_test_mprotect_reaches_gpu,
+                                        orbis_test_cond_write, and the three knobs that drove them
+    task-NN references in src/          49 -> 0
+
+⚠ **`gen-tile-tables.py` was nearly deleted as a dead probe and must not be.** It GENERATES
+`src/amd/common/orbis_tile_tables.h`, a driver source. `tilecheck` stays too - HANDOFF's "A3" wants
+it pointed at a layered MSAA image.
+
+`gen.py` now `unlink()`s its intermediate `.spv`; three of them had sat checked in looking like
+inputs. Regenerating the three headers reproduces them byte-identically, so the committed products
+match their sources.
+
+## ⚠ Four instruments that report success without checking - three found today
+
+    build.sh --host-orbis     reads probe EXIT CODES, never their output. Three futex self-tests print
+                              FAILED in the same run it calls "every probe exited cleanly". Not a
+                              regression - the untouched backup tree does the same. See
+                              [[host-orbis-gate-does-not-read-its-own-log]].
+    -Wno-unused-function      is ON in this build, so orphaning a static function is silent. After
+                              cutting the probes it had to be checked by hand.
+    git status --porcelain    `grep -v "^[MADR]"` HIDES the `AD` state (staged-add, deleted on disk).
+                              25 files sat in that state for hours because the check filtered them out.
+    byte-comparing artefacts  see below.
+
+## Comparing built artefacts: identity is useful, difference is not
+
+Three times today a byte difference was nearly read as a finding:
+
+    PS4 .pkg                 NON-DETERMINISTIC. Two packagings of the same eboot differ. Compare
+                             eboot.bin instead - that IS deterministic.
+    deqp-vk                  embeds the CTS commit SHA (qpReleaseInfo.inl). One amend moved 587490 bytes.
+    libvulkan_radeon.a       embeds constants in radv_physical_device.c.o. The differing-byte count
+                             went 83 -> 80 -> 67 across builds whose code was identical.
+
+⚠ **The build IS deterministic** - two from-scratch builds of the same tree give a byte-identical
+archive, measured. So *identical* means the same driver and can be relied on. *Different* means only
+that the input differed, and the count of differing bytes means nothing at all.
+⚠ A comment-only edit to `ac_surface.c` changed 67 bytes of those constants. The mechanism was NOT
+identified. It is benign for correctness; do not build an argument on it.
+
+## State, and what is waiting for the maintainer
+
+    ~/src-ps4/mesa-ps4        73 files staged. Cross build 768/768 clean, linkprobe links,
+                              --host-orbis identical to the backup-tree control. NOT COMMITTED.
+    ~/src-ps4/orbis-compat    M include/signal.h + 2 untracked moved files
+                              (cmake/orbis.ini.in, test/umtxcheck.c). NOT STAGED - the maintainer
+                              had not said whether to stage them.
+    ~/src-ps4/VK-GL-CTS       3 untracked in targets/orbis/ - the run configuration moved there.
+                              NOT COMMITTED.
+    ~/src-ps4/ps4-mesa-docs   03b651a. ⚠ UNSIGNED - gpg timed out.
+                              Fix: `git commit --amend --no-edit -S`
+
+Open questions the maintainer has not answered: a GitHub organisation (`orbis-ports` was the
+candidate; the three unpublished repos are free to create there, the four forks carry committed
+`.gitmodules` URLs and four open upstream PRs), and whether `mesa-ps4`/`ps4-mesa-docs` should be
+renamed `orbis-*` to match the code's own vocabulary - the `__PS4__` -> `__ORBIS__` rename is still
+an open item in this file, twice.
+
+---
+
+# Handoff — the review plan is executed, and two of its fixes needed fixes of their own, 2026-08-22 (close)
+
+All fifteen findings of `mesa-ps4/PLAN.md` are done. This entry is what a reader needs in order to
+judge the work rather than repeat it.
+
+## What was verified, and how
+
+    cross build (build-orbis)     0 failed targets, 0 compile errors, libvulkan_radeon.a 36138470 B
+    link probe                    linked 26455800 B -> build-orbis/linkprobe.elf
+    --host-orbis gate             rc=0, identical to the documented control: 3 futex self-tests print
+                                  FAILED and the gate still says "every probe exited cleanly"
+    build-host (NO orbis)         ⚠ CONFIGURED AND BUILT FOR THE FIRST TIME IN THIS TREE.
+                                  -Dplatforms= , MESA_SYSTEM_HAS_KMS_DRM=1 -> libvulkan_radeon.so links
+
+That last line is the point of phase 1. `build.sh --host` has existed all along and had never been
+run here, which is exactly why 1.1 survived: the only two configurations anyone built were the two
+that define HAVE_ORBIS_PLATFORM.
+
+⚠ **1.1 was confirmed by control, not by reading.** With the guard removed again and only that one
+file recompiled:
+
+    ../src/amd/vulkan/radv_queue.c:592:4: error: implicit declaration of function
+    'ac_orbis_note_gs_ring_sizes' [-Wimplicit-function-declaration]
+
+and `-Werror=implicit-function-declaration` is in that build's command line. The call site carried a
+comment saying "the note is a no-op elsewhere". It was not: nothing declares it and nothing defines
+it outside the Orbis build.
+
+## The two premises the review asserted without a source, and what they turned out to be
+
+**2.4, the tess factor ring — the premise was RIGHT, and now it is cited.** Mesa ships the register
+database this port had never opened:
+
+    src/amd/registers/gfx6..gfx10.json    VGT_TF_RING_SIZE.SIZE  bits [0,15]   16 bits, max 0xFFFF
+    src/amd/registers/gfx11.json                                 bits [0,16]   17 bits
+
+256 workgroups x 1024 B = 65536 dwords = 0x10000, one past the field on Liverpool. The generated
+`S_030938_SIZE` / `C_030938_SIZE` pair is built from the WIDEST definition, which is why the assert
+in `ac_cmdbuf_cp.c` had a hole exactly where the value sat. Clamped in two places - the count in
+`ac_gpu_info.c` and the register in `ac_cmdbuf_cp.c`, the latter per generation and loud.
+
+**4.3, COND_EXEC - also right, and citable from this tree.** `src/amd/packets/cp_pm4_table_data_gfx11.json`
+and its gfx12 twin give EXEC_COUNT as bits 13:0 for both the PFP and MEC forms: 16383 dwords. The
+loop was predicating `per_draw * n` in ONE packet, 46 dwords a draw by default, so ~357 indirect
+draws under conditional rendering overflowed it and the PFP would resume inside a packet. Now one
+COND_EXEC per draw, which cannot overflow. AMD publishes no gfx7 table in this tree, so the width is
+established for gfx11/gfx12 and assumed unchanged backwards - say so rather than claim more.
+
+## 2.3 could not be fixed the way the plan wrote it
+
+The plan offered "gate the new arm on `vk_device_has_timeline_syncobj`", which would simply delete
+the arm this port added, and "or gate `.transfer` in u_sync_provider.c". The second is right - the
+DRM provider filled the entry in unconditionally while the kernel refuses the ioctl with -EOPNOTSUPP
+unless the driver has DRIVER_SYNCOBJ_TIMELINE, the same bit DRM_CAP_SYNCOBJ_TIMELINE reports - but
+doing only that turns two error paths into NULL dereferences: `radv_amdgpu_cs.c` calls
+`ac_drm_cs_syncobj_transfer` on its `!has_fence_to_handle` arm, which is reachable on old kernels.
+So both wrappers in `ac_linux_drm.c` now return -EOPNOTSUPP for a NULL entry, which leaves every
+existing caller's error handling doing what it already did.
+
+## ⚠ TWO FIXES BROKE SOMETHING AND THE GATE SHOWED ONE OF THEM
+
+**5.2 turned the residue detector into a liar.** Freeing the enumeration's probe device - a one-line
+leak fix - made `orbis_report_residue()` run on a device holding nothing, which recorded ZERO as the
+previous sample. The next teardown, the first real one, then read as growth:
+
+    MESA: warning: orbis-drm: RESIDUE GREW across devices - 4 BO(s) was 0, 2 syncobj(s) was 0 ...
+                   - something is leaking per device
+
+in a run with no leak in it. Fixed by not letting an all-zero teardown become the baseline. It now
+reports four device cycles at a steady 4 BOs / 2 syncobjs / 4 VA ranges, "and it did not grow".
+
+⚠ This is the fourth instance of the shape this project keeps meeting, and the first where the
+assistant caused it: **a change that makes an instrument report the wrong thing is worse than the
+defect it fixed**, because the next real warning is now ignored. It was caught only by re-running
+the gate and reading its output - the same discipline that
+[[host-orbis-gate-does-not-read-its-own-log]] is about.
+
+**The unsequenced marker.** Not in the review at all; the cross build has been printing it:
+
+    ac_orbis_drm.c:1338: warning: unsequenced modification and access to 'dst' [-Wunsequenced]
+    *dst++ = (uint32_t)(dst - out_base);
+
+Undefined behaviour, and the value differs by one dword depending on what the compiler chose that
+day. The progress marker it writes is the thing that says where the CP stopped, so it was a
+diagnostic that could be off by a packet boundary. Spelled out to the documented intent.
+
+## Everything else, one line each
+
+    2.1  the GARLIC chunk now rides on the retire entry with the mprotect revoke, so the pages are
+         not swapped and released under a GPU still executing the frame. A MAP that cancels a parked
+         entry hands the chunk back synchronously - the address is being re-let that instant.
+         ⚠ ORDER IS LOAD-BEARING: the chunk goes back BEFORE the protect, or the fresh MAP_FIXED
+         mapping hands the rights back to a range the drain is about to revoke.
+    2.2  present, then take the scan-out down, THEN free the images. The destroy loop used to free
+         them first and the flush then read prev->cpu_map from a destroyed image. wsi_orbis's
+         teardown also drains pending flips when the buffers are the swapchain's own.
+    3.1  the fence-slot spin has a deadline. It held orbis_submit_lock, so a GPU hang wedged every
+         later vkQueueSubmit - the console had to be pulled from the wall. It is the ONE wait that
+         keeps a hard cap, and it says why.
+    3.2  one orbis_retire_lock for push, drain and cancel. Three disjoint locks around one ring is
+         the same as none. Order: submit -> retire -> va.
+    4.1  one format table, read by get_formats AND get_formats2. The Orbis restriction was in the
+         first only, and Formats2 is the entry point dxvk uses - red and blue swapped.
+    4.4  one exit from queue_present. Three paths returned without releasing or handing on the
+         image, so every failed flip consumed one for the life of the swapchain.
+    4.5  the 5 s cap is a WATCHDOG now, not an answer. vkWaitForFences(UINT64_MAX) may not return
+         VK_TIMEOUT. It logs every five seconds and honours the caller's own deadline.
+    5.1  the four per-chunk mesa_logi are behind orbis_trace(). 84 submits a second x 4 lines,
+         flushed to storage inside the submit lock.
+
+## The change set
+
+    +8   -1    src/util/u_sync_provider.c
+    +16  -0    src/amd/common/ac_linux_drm.c
+    +7   -0    src/vulkan/runtime/vk_drm_syncobj.c
+    +316 -52   src/amd/common/ac_orbis_drm.c
+    +103 -101  src/vulkan/wsi/wsi_common_headless.c
+    +22  -0    src/vulkan/wsi/wsi_orbis.c
+    +35  -1    src/amd/common/ac_gpu_info.c
+    +33  -1    src/amd/common/ac_cmdbuf_cp.c
+    +48  -5    src/amd/vulkan/radv_cmd_buffer.c
+    +11  -0    src/amd/vulkan/radv_orbis_winsys.c
+    +12  -2    src/amd/vulkan/radv_queue.c
+    +7   -3    src/amd/vulkan/radv_instance.c
+    +10  -3    src/amd/vulkan/radv_physical_device.c
+    +4   -2    src/amd/vulkan/radv_physical_device.h
+
+The pre-plan state is kept as two patches under the job's scratch directory
+(`staged-before-plan.patch`, `worktree-before-plan.patch`); that is scratch and will not survive, so
+anything wanted from it has to be taken before the job is deleted.
+
+## ⚠ THE INDEX HOLDS A STALE ac_orbis_drm.c
+
+`git status` shows it as `AM`: the version STAGED is the one from before the previous session cut
+454 lines of probes out of it. The working tree is the truth and everything above was built from it.
+A plain `git commit` would commit the old file. `git add -A` before committing - PLAN.md is on line 1
+of `.git/info/exclude`, so it cannot be swept in.
+
+## What has NOT been done
+
+  * ⚠ **Nothing here ran on the console.** Every one of these fixes is on a path a title exercises -
+    the retire queue, the present, the submit lock, indirect draws. The cross build and the host arm
+    say they compile and that the host-side probes still pass; they say nothing about the hardware.
+    One console run is not a verdict either ([[one-console-run-is-not-a-verdict]]), so the CTS is the
+    instrument for this, not one boot of the title.
+  * 1.2 is Windows-only and was not compiled. The change is mechanical - the predicate for "this is
+    the console" is HAVE_ORBIS_PLATFORM, and `!MESA_SYSTEM_HAS_KMS_DRM` was catching Windows too -
+    but it is reasoned, not built.
+  * The review's own stated gap is still open: its `build-support/` finder returned nothing.
+  * Still waiting on the maintainer: the commits themselves (`difit .`), the unsigned
+    ps4-mesa-docs commit, whether to stage the two moved files in orbis-compat, the GitHub
+    organisation, and the `__PS4__` -> `__ORBIS__` rename.
+
+## The plan on hardware: three CTS runs, and what the control settled, 2026-08-22 (evening)
+
+The fifteen fixes were taken to the console. Three runs of the SAME 735-case list, two of them on the
+new driver and one on the old one as a control.
+
+    package    cts-plan-20260822.pkg     the driver with PLAN.md executed
+    control    cts-nopatch-20260821.pkg  same CTS fork commit 2c6c32438 (its binary linked four
+                                         minutes after that commit), same vkloader, same target
+                                         file - ONLY ORBIS_RADV_LIB differs, pointing at the backup
+                                         checkout's 21 Aug archive
+    list       api.smoke + api.object_management.multithreaded_* (the 140 with a baseline)
+               + draw.renderpass.indirect_draw.* + indirect_instanced.*
+               + memory.allocation.* + synchronization.basic.*
+
+                         Pass   Fail   NotSupported
+    plan run 1            718     2         15
+    plan run 2            717     3         15
+    control (21 Aug)      719     1         15
+
+### The baseline did not move
+
+All 140 cases that have a 21 Aug baseline passed in every run, and the test-by-test diff of verdict
+IDENTITIES is empty in both plan runs. That is the regression answer: executing the plan changed
+nothing on the only set that could tell.
+
+### One real defect, and the control proved it is DEBT
+
+    dEQP-VK.synchronization.basic.event.device_set_reset    Fail on ALL THREE runs
+
+and the driver log carries, identically in all three, five `syncobj wait timed out` at fence labels
+
+    889 889 889 890 892 893 893 894
+
+Byte-for-byte the same sequence on both drivers. `event.host_set_reset` - the same event set by the
+CPU - passes; only the GPU-side `vkCmdSetEvent` fails, and the submission carrying it never retires.
+⚠ That is the fourth instance of this port's recurring shape: **RADV emits a packet this command
+processor does not implement and the CP stalls rather than failing.** Task #34 carries the leads.
+
+### The indirect_draw failures are noise, and the third run is what settled that
+
+    run 1   1 failure    indexed_data_from_compute_alloc_offset_16 ... no_first_instance.triangle_strip
+    run 2   2 failures   two OTHER cases; run 1's failure PASSED
+    control 0 failures
+
+Three runs, three disjoint answers, out of 364 cases. Exactly [[counts-hide-nondeterminism]]: the
+count reads like a measurement and the identity is a coin toss. ⚠ **Nothing about the indirect-draw
+path was established by any of this**, in either direction.
+
+### Two things the runs said about the plan's own fixes
+
+**5.2 is visible in the numbers.** Teardowns per run: control 330, plan runs 455 and 444. The ~120
+extra are one per physical-device enumeration - the probe device that used to leak and is now freed.
+
+**The residue detector's noise is NOT from the plan.** `RESIDUE GREW` fires 122/330 in the control
+(37%) against 124/455 and 127/444 in the plan runs (27%, 29%). The zero-baseline false positive this
+session introduced and fixed is gone - only three all-zero teardowns remain and none becomes the
+baseline. What is left is the detector's own weakness, pre-existing: it compares against the
+IMMEDIATELY PREVIOUS sample rather than against the floor, and residue legitimately oscillates
+between 11 and 17 BOs while the floor stays at 11. A real per-device leak would ratchet; this does
+not. Worth fixing, but it is not today's.
+
+### What these runs did NOT measure
+
+  * **4.3 was never executed.** The per-draw COND_EXEC only emits under conditional rendering, and
+    none of the 364 indirect-draw cases enables it - `radv_orbis_predicate_next` returned false every
+    time. `dEQP-VK.conditional_rendering.*` is the set for it and has not been run.
+  * **4.5's watchdog never fired**, in any of the three runs. No wait reached five seconds, so every
+    timeout above came from a caller deadline SHORTER than the cap - a regime where the change is a
+    no-op. The unbounded-wait path is still untested on hardware.
+  * 4.1 (Formats2), 2.2 (swapchain destroy) and 2.1's GARLIC deferral were not covered by this list
+    either; WSI is NotSupported on this target and nothing here destroys a swapchain.
+
+### ⚠ The trap this nearly walked into
+
+Both CTS build directories in the fork were configured with
+`ORBIS_RADV_LIB=/home/mikolaj/src/mesa-ps4/build-orbis/...` - the BACKUP checkout. Rebuilding either
+would have packaged the 21 August driver and the run would have said nothing about the plan, with
+nothing anywhere announcing it. `cts.md` named that path too, and `~/src/Tempest/scripts/ps4/make-pkg.sh`
+which moved to `orbis-compat/scripts/ps4/` some time ago. Both corrected, and cts.md now carries the
+check: `grep ORBIS_RADV_LIB build-orbis/CMakeCache.txt`.
+
+Verification that the right driver shipped was NOT the package size - all three CTS packages are
+exactly 109117440 bytes - but `nm` on deqp-vk finding `orbis_garlic_put_back` and `orbis_retire_lock`,
+symbols that exist only in today's tree.
+
+### Console state
+
+    /data/pkg/cts-plan-20260822.pkg      the driver with the plan executed
+    /data/pkg/cts-nopatch-20260821.pkg   the control
+    /data/deqp-results-plan.qpa          run 1        /data/deqp-mesa-plan.log
+    /data/deqp-results-plan2.qpa         run 2        /data/deqp-mesa-plan2.log
+    /data/deqp-results-old735.qpa        control      /data/deqp-mesa-old735.log
+    /data/deqp-results-nopatch.qpa       the 21 Aug 140-case baseline, untouched
+    /data/deqp-args-nopatch.txt          its run configuration, preserved before overwriting
+
+## conditional_rendering: 4.3 answered, and 23 failures that are all debt, 2026-08-22 (late)
+
+The three earlier runs never executed finding 4.3's code once - `radv_orbis_predicate_next` returns
+false unless conditional rendering is enabled, and none of the 364 indirect-draw cases enables it.
+This is the set where it runs. 1030 cases plus the 140-case baseline anchor, on the plan driver and
+then on the pre-plan driver as a control.
+
+                     Pass   Fail   NotSupported
+    plan driver       627     23        520
+    control (21 Aug)  627     23        520
+
+⚠ **Zero verdict changes. The 23 failure NAMES are identical, and so is the 520-case NotSupported
+set.** Not "the same counts" - this project has been burned by that - the same names.
+
+### 4.3 works, in the regime the CTS can reach
+
+    conditional_rendering.draw        168 ran, 168 Pass, 0 Fail   (on BOTH drivers)
+      draw_indirect                    28 Pass
+      draw_indexed_indirect            28 Pass
+      draw_indirect_count              28 Pass
+      draw_indexed_indirect_count      28 Pass
+
+112 indirect draws under conditional rendering, each now emitting a COND_EXEC inside the loop rather
+than one packet covering `per_draw * n` dwords. No timeouts, no GPU faults, no wedge; the fence-slot
+throttle from 3.1 was entered once (its cap message logged) and never expired.
+
+⚠ **The overflow itself is still untested.** Reaching the 14-bit EXEC_COUNT limit needs more than
+about 357 predicated indirect draws in one command buffer and nothing in the CTS does that. What is
+established is that the new shape is correct, not that the old one broke. Those are different
+claims.
+
+### The 23, in three coherent clusters - all pre-existing
+
+    9 of 9    transform_feedback.*        "Expected value at index 6 was 2, but actual value was 0",
+                                          identical in all nine INCLUDING the plain non-indirect
+                                          draw - so it looks like XFB rather than predication
+    8 of 139  draw_clear.clear            image comparison, max difference (0.5,0,0,0) and
+                                          (0.3,0,0,0) - RED CHANNEL ONLY, and only the
+                                          *_full_no_offset variants; every *_partial_offset passes
+    6 of 90   dispatch.condition_size     second_byte, third_byte, fourth_byte x2. The non-zero part
+                                          of the 32-bit condition placed at byte 1, 2 or 3;
+                                          first_byte passes. Something evaluates less than the whole
+                                          dword.
+
+Task #35 carries the leads for each.
+
+### Two of the plan's own fixes are visible in the logs
+
+**5.1, and it is the largest single effect measured today.** Driver log for the same 1170 cases:
+
+    control     3620 lines
+    plan run     927 lines
+
+~2700 lines gone. Those were the four per-chunk `mesa_logi` calls that ran on every submission and
+were flushed to storage INSIDE the global submit lock. That is what "84 submits a second times four
+lines" costs, and it is now behind `orbis_trace()`.
+
+**5.2 again.** Teardowns 133 (control) against 246 - one extra per physical-device enumeration,
+which is the probe device that used to leak. And the residue detector's noise is proportionally
+lower on the plan driver in this run too: 118/133 (89%) against 123/246 (50%).
+
+### Where the plan now stands on hardware
+
+Five runs, two drivers, three case sets. Everything the CTS can reach says the plan changed nothing
+it should not have and fixed what it claimed to. What remains unmeasured on hardware:
+
+  * 4.5's watchdog - never fired in any of the five runs, so the unbounded-wait path is untouched
+  * 4.1 (Formats2), 2.2 (swapchain destroy), 2.1's deferred GARLIC restore - no case set here
+    reaches them; WSI is NotSupported on this target
+  * 1.2 - Windows only, not compiled anywhere
+  * 4.3's overflow - as above
+
+## The title on the plan's driver: 3328 frames, and the coverage gap is closed, 2026-08-23
+
+The five CTS runs of 2026-08-22 answered nothing about four of the fifteen fixes, because no case
+set reaches them. OpenGothic does. Built against `~/src-ps4/mesa-ps4/build-orbis` - confirmed from
+`link.txt`, not assumed - packaged as `og-plan-20260823.pkg`, installed and played.
+
+    3328 frames, 1293 submissions, ~50 fps average - the usual figure for this title
+
+    syncobj timeouts            0
+    4.5's watchdog              0        no wait reached five seconds
+    RESIDUE GREW                0
+    fence-slot exhaustion       0        3.1's cap logged once, never expired
+    Protection faults           0
+
+⚠ **Zero protection faults over 3328 frames is the direct answer on 2.1.** Deferring the GARLIC
+restore behind the retire fence changes when physical pages are swapped out from under a running
+GPU; if the synchronisation were wrong, a fault or visible corruption is the first thing it would
+produce. Neither appeared, and the title looks and performs as it did before.
+
+One warning fired: `THE GPU HAS NOT FINISHED submit #1293 - the fence label has been stuck at 1292
+for 4 submissions while 5 were queued`, with a stream dump. The title recovered and carried on.
+**The maintainer identifies this as a long-standing defect, not new.** Its address audit is worth
+recording anyway because it exonerates 2.1 specifically: `0/0 SET_BASE and 0/16 DMA_DATA addresses
+are NOT in any live mapping` - nothing in the hung submission pointed at freed memory, which is
+exactly what a mis-deferred GARLIC restore would have produced.
+
+### ⚠ A THIRD STALE DEFAULT, and this one was live
+
+`orbis-compat/vkloader/CMakeLists.txt` defaults `ORBIS_MESA_BUILD` to
+`~/.cache/orbis-mesa/mesa/build-orbis` - the patch-queue era's path. OpenGothic passed no override,
+and that path still holds a driver dated 2026-08-21 22:04. The title would have linked the previous
+day's RADV, run perfectly, and every measurement taken from it would have been about changes it did
+not contain.
+
+That is the third variant of one trap in two days:
+
+    VK-GL-CTS's two build dirs   -> ~/src/mesa-ps4        (the backup checkout)
+    cts.md's recipe              -> ~/src/mesa-ps4
+    vkloader's default           -> ~/.cache/orbis-mesa/mesa
+
+All three named a path that looked right. The date was the only thing that separated them, and
+nothing printed it. `orbis-compat/scripts/ps4/orbis-env.sh` now resolves the checkout once and
+exports `ORBIS_MESA_DIR` / `ORBIS_MESA_BUILD` / `ORBIS_RADV_ARCHIVE`; `orbis_announce_driver()`
+prints the archive AND its build time, and every entry point calls it before configuring.
+
+### Two smaller things this run exposed
+
+⚠ **The console's clock is ~46 minutes ahead of the host.** Measured, not assumed: a file uploaded
+at host 09:35:43 lists as `sie 23 10:22`. FTP timestamps and local mtimes are therefore not
+comparable, and comparing them produced a confident wrong conclusion ("the run was not captured")
+about a capture that was fine. See [[ps4-console-access-and-logs]].
+
+⚠ **The title writes its driver log to `/data/deqp-mesa-default.log`** - a name that says deqp. This
+run overwrote a 4.3 MB CTS baseline. `tempest-env.txt` warns about exactly this in its own comments
+and then does it; the file needs a name of its own.
+
+---
+
+# Handoff — the plan is done and verified, everything is published, 2026-08-23 (close)
+
+Written for a session picking up after `mesa-ps4/PLAN.md` was carried out and taken to hardware.
+The three entries above this one are the detail; this is the map and what is left.
+
+## Everything now lives in the orbis-ports organisation
+
+    orbis-ports/mesa-ps4        orbis        own        the driver
+    orbis-ports/orbis-compat    master       own        the platform overlay - EVERY other repo needs it
+    orbis-ports/ps4-mesa-docs   main         own        this file
+    orbis-ports/OpenGothic      ps4-support  fork       default branch is ps4-support, not master
+    orbis-ports/Tempest         ps4-support  fork
+    orbis-ports/ZenKit          ps4-support  fork
+    orbis-ports/VK-GL-CTS       ps4-support  fork
+    orbis-ports/RetroArch       ps4-support  fork       the ps4-support branch existed ONLY locally until today
+
+All public. The four Try/Khronos forks were TRANSFERRED, so the upstream relationship and the
+redirects from `mikolajmikolajczyk/*` survive; RetroArch was forked fresh because its origin had
+always been libretro's own repository.
+
+⚠ **mesa-ps4's history is 227793 commits and a single push of it FAILS.** It disconnected mid-pack
+and left an empty repository that still exited 0. It went up in twelve staged pushes of ~20000
+commits each; the script is worth reconstructing rather than retrying the single push.
+
+## The build contract - one entry point per repository
+
+Clone the repositories NEXT TO EACH OTHER and nothing needs setting:
+
+    ps4/build.sh                in mesa-ps4, VK-GL-CTS, OpenGothic
+    ps4/build-core.sh           in RetroArch (cores only; the app has no script yet)
+
+All of them source `orbis-compat/scripts/ps4/orbis-env.sh`, which resolves and verifies
+`ORBIS_COMPAT_DIR`, `OO_PS4_TOOLCHAIN`, `ORBIS_MESA_DIR`, `ORBIS_WORK` and `ORBIS_JOBS`. Finding
+orbis-compat is the one thing that cannot be shared, so each entry point carries six lines of path
+search; copy that block verbatim rather than inventing a variant.
+
+Deploy with `orbis-compat/scripts/ps4/deploy.sh --pkg <file> --name <short>`: it uploads to
+`/data/pkg/<name>-YYYYMMDD.pkg`, verifies by reading back, and ends by saying INSTALL + RUN or
+RUN, no install.
+
+## ⚠ THE ONE PATTERN THIS WEEK KEEPS PRODUCING
+
+**A path that looks right, pointing at a driver from another day, with nothing printing the date.**
+Three instances in two days, all live:
+
+    VK-GL-CTS's two build dirs   -> ~/src/mesa-ps4              the backup checkout
+    cts.md's configure recipe    -> ~/src/mesa-ps4
+    vkloader/CMakeLists.txt      -> ~/.cache/orbis-mesa/mesa    the patch-queue era
+
+Each would have produced a build that ran perfectly and proved nothing. `orbis_announce_driver()`
+now prints the archive and its build time before every configure, and the CTS entry point REFUSES
+when its cmake cache names a different one.
+
+⚠ **And the same shape kept appearing in the tooling itself - five times, all self-inflicted:**
+
+    git push               exited 0 after disconnecting; the repository was empty
+    deploy.sh              ran lftp with output to /dev/null under set -e: a refused transfer
+                           ended the script between two lines, silently
+    deploy.sh              read field 5 - the MONTH - as the byte count, and reported
+                           "is sie bytes, sent 51314688" on a transfer that had succeeded.
+                           Visible only because the locale is Polish; under English it would have
+                           compared 51314688 against "Aug" and looked ordinary
+    a ref verification     printed ZGODNE for all eight repositories without reading a single SHA
+    a log search           reported "in none of them" against files that contain no MESA lines at all
+
+The rule that catches all five: **make the check print what it measured**, not a verdict.
+
+## Where the fifteen findings stand
+
+Executed, built, and taken to hardware. Every failure found was attributed by a CONTROL run rather
+than guessed at:
+
+    CTS 735 cases x2 + control    baseline 140/140, zero verdict changes
+    CTS 1170 conditional_rendering x2   verdict SETS identical between drivers
+    OpenGothic 3328 frames        0 protection faults, 0 timeouts, ~50 fps as before
+
+Three defects surfaced and all three are DEBT: `event.device_set_reset` (task #34), the three
+conditional_rendering clusters (task #35), and the hung-submit warning at #1293, which the
+maintainer identifies as long-standing.
+
+⚠ **Still unmeasured on hardware**: 4.5's watchdog (no wait ever reached five seconds), 4.3's
+EXEC_COUNT overflow (no CTS case emits ~357 predicated indirect draws), 4.1's Formats2, and 1.2
+which is Windows-only and has never been compiled anywhere.
+
+## State, and what is waiting
+
+    mesa-ps4        b327f8afbc1   clean, pushed
+    orbis-compat    7ba8720       3 uncommitted: orbis-env.sh, deploy.sh, vkloader/CMakeLists.txt
+    ps4-mesa-docs   e915911       1 uncommitted: this file
+    OpenGothic      6669da67      2 uncommitted: ps4/build.sh, ps4/tempest-env.example.txt
+    VK-GL-CTS       b7463f0bc     clean, pushed
+    Tempest         d4d05d2f      clean       ZenKit  39bf134  clean
+    RetroArch       4920537011    1 uncommitted: ps4/build-core.sh - LEFT ON PURPOSE
+
+⚠ **The console's clock is ~46 minutes AHEAD of the host.** Measured. FTP listings and local mtimes
+are not comparable, and comparing them produced a confident wrong conclusion today.
+
+Open, not decided: RetroArch's app build has no script (`TARGET=retroarch_orbis` by hand); the
+`192.168.100.x` addresses are hardcoded in orbis-compat's scripts except deploy.sh; the residue
+detector compares against the previous sample rather than the floor and cries in ~30% of teardowns;
+and the review's own gap - its `build-support/` finder returned nothing and nobody has looked.
