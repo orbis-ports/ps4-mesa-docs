@@ -3736,6 +3736,50 @@ produced no keyboard or mouse line while ps4_log output from the same run was th
 "no mouse: open in the log" was misread as "the mouse did not open". **Anything meant to be
 diagnosable on hardware must go through ps4_log.**
 
+## ⚠ swanstation IS WITHHELD: IT BUILDS, IT DOES NOT RUN
+
+Added to PS4_CORE_DROP on 2026-08-29. It builds cleanly and dies on the first game, which is the
+worst thing a core list can contain - a name somebody picks over the one that works. The patches
+stay in the tree; only the offering stops. `mednafen_psx_hw` remains this port's PlayStation core:
+it holds 50 fps with a recompiler and its own Vulkan renderer.
+
+### FOUR FAULTS WERE FIXED IN IT, AND ALL FOUR WERE THE SAME FAULT
+
+⚠ **EVERY ONE WAS `__FreeBSD__` MISSING FROM A C++ TU** - this SDK's libc++ clears it on purpose
+(see the section above) - AND EVERY ONE PRESENTED DIFFERENTLY:
+
+    memory_arena.cpp    `#error Unknown platform.` and `use of undeclared identifier 'm_shmem_fd'`
+    cpu_recompiler      `#error Unknown ABI.` x11, plus every register name reported undeclared
+    jit_code_buffer     NO error at all - the chain fell through to `#else return false;`, so
+                        JitCodeBuffer::Allocate quietly returned false and the throw surfaced as
+                        `uncaught exception of type Xbyak::Error`, pointing at the wrong library
+                        entirely. Xbyak is HANDED a buffer; it threw because it got none.
+    memory_arena, again my own first patch only made it COMPILE and claimed in its comment that
+                        "the arena backs fastmem, and swanstation runs without it". It does not:
+                        bus.cpp:263 allocates the console's ENTIRE RAM through it. That comment was
+                        wrong, on hardware, for a day - `ERROR: Failed to allocate memory`.
+
+⚠ **AND THE jit_code_buffer ARM CARRIES A LATENT BUG FOR EVERY PLATFORM IT SERVES**, which is worth
+lifting even though this core is parked: it maps with `PROT_READ|PROT_WRITE|PROT_EXEC` in one call
+and then tests the result with `if (!m_code_ptr)`. mmap reports failure as MAP_FAILED, which is
+(void*)-1, not NULL - so a refused mapping passes that test and travels on as a pointer.
+
+### THE FIFTH, WHICH IS WHY IT IS PARKED - AND IT IS NOT A swanstation BUG
+
+    reason: page fault (user write data, page not present)
+    fault address: 0000000803f61000     rax: same     rdx: 0000000006440000
+    CPU::CodeCache::AllocateFastMap  (swanstation_libretro.prx + 0x19b1b9)
+
+`s_fast_map_pointers = std::make_unique<HostCodePointer[]>(num_slots)` - an ordinary `new[]` of
+about 105 MB. make_unique would have thrown bad_alloc on failure and did not, so **the allocation
+reported success and the pages are not there**. That is a level below the core: musl's malloc goes
+through orbis-compat's mmap interposer, which suballocates from 128 MiB carve-outs.
+
+⚠ **SO THIS IS WORTH CHASING FOR ITS OWN SAKE, NOT FOR swanstation'S.** An allocator that returns
+addresses it has not backed would affect every title in this organisation, and it would look like
+a different bug in each one. The next step is a standalone probe: allocate ~105 MB, touch every
+page, and see where it stops.
+
 ### Cheapest next steps, in order
 
     melondsds     harness-side, not core-side: two CMake targets compile the same zlib sources.
