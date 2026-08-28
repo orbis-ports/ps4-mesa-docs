@@ -3096,3 +3096,104 @@ the receiver while RetroArch runs, and the driver surviving with no receiver att
 Still open: **`character` is always 0**, so RetroArch's own text fields take nothing;
 `sceKeyboardGetKey2Char` has a real signature but one parameter is `bool unknown`. And the
 **mouse** is not started - every `sceMouse*` past `Init` is a name without a signature.
+
+## 2026-08-28, close of day — where this stands, and PlayStation 2 next
+
+### What is live
+
+v0.1.5 is released and on `cores.prx0.com`: `RetroArchV-PS4-v0.1.5.pkg`, 63 569 920 bytes, 101
+cores in the index, the page rebuilt for it. Quit returns to the console's menu with no dialog,
+framebuffer emulation works on Nintendo 64, sound survives switching games, and files no longer
+land in another title's directory.
+
+### What is committed and NOT pushed
+
+One commit per repository, both finished and both local:
+
+    orbis-ports/RetroArch     cabc0080f5  (ps4) Keyboard, pad recovery, and the page in CI
+    orbis-ports/ps4-mesa-docs ddce559     Record the keyboard, the pad latch, and the handle leak
+
+⚠ **`802ad9ef8b`'s content is inside that RetroArch commit and it changes nothing until the next
+FULL cores run** - it is the step that builds and uploads the download page from the publish job.
+Until then the page is still whatever was uploaded by hand on 2026-08-28. And the ordering it
+needs is written into the step: **tag the frontend, let frontend.yml cut the release, THEN run
+cores** - the page reads the newest release for its version and package link.
+
+### ⚠ THE WORKING RULES THIS SESSION HAD TO LEARN, WHICH ARE NOT ABOUT THE PORT
+
+**One commit, amended.** Not a commit per finished piece. This branch reached 142 commits of which
+75 touched nothing but a `.md`, and had to be rewritten to 30. Do not push without being asked.
+
+**The narrative lives here, not in the code repository.** `ps4/RELEASE-NOTES.md` and
+`ps4/CORE-STATUS.md` stayed in the RetroArch tree because the build reads them - a release's
+`body_path` and the sharder's size table. Everything else moved.
+
+**A control that is remembered is not a control.** A whole day went into the close-hang on the
+belief that a build without Mesa exited cleanly. It did not; that recollection was of a build from
+before the port stopped idling at Quit. Building the control settled it in one install.
+
+### Open, cheapest first
+
+    pcsx_rearmed        fails at LINK on lightrec_init_mmap - the same executable-memory problem
+                        already solved for Beetle PSX. Purely local work, no console needed.
+    keyboard character  input_keyboard_event gets character 0, so RetroArch's own text fields take
+                        nothing. sceKeyboardGetKey2Char has a real signature; one parameter is
+                        `bool unknown`, so it is a probe rather than a guess.
+    PrBoom Load State   does NOT crash on the host - seven in-session loads and a cross-session
+                        one, same commit, same WAD. On the console retro_serialize_size() returned
+                        198200, which is exactly sizeof(extra) + 0x30000, the FLOOR, reached only
+                        when thinkercap.next == NULL - a thinker list never initialised, not merely
+                        empty (an empty one points at itself). So the core had no live level at the
+                        moment of the load. One log line in the core settles it.
+    GLideN64 clipping   `gl_Position.z /= 8.0` is never scaled back on this build. Now cheap to
+                        test: patch 0008 added an `enableClipping` knob in /data/retroarch-gliden64.
+    nestopia            loads, runs, exits cleanly, renders a green screen.
+    coverage            61 of 101 built cores untested on hardware; 62 of 164 do not build.
+    GL_TEXTURE_EXTERNAL_OES   `GL_INVALID_ENUM in glFramebufferTexture2D(unknown textarget 0x8d65)`,
+                        seen on the host, pre-existing, nobody has looked.
+
+## ⚠ NEXT: PlayStation 2, and what the recipe already says about it
+
+The maintainer wants to see what can be got out of PS2 emulation here. Two cores exist in
+`cores-linux-x64-generic`, and a third that is barely a project:
+
+    pcsx2   https://github.com/libretro/pcsx2.git   CMAKE
+    play    https://github.com/jpd002/Play-.git     CMAKE
+    yaps2   https://github.com/yaps2/yaps2.git      CMAKE
+
+⚠ **THE FIRST BLOCKER IS NOT PS2 AT ALL, AND FIXING IT PAYS FOR MORE THAN PS2.**
+`ps4/build-cores.sh:500` skips every CMAKE core for want of a toolchain file - **seventeen cores**,
+and the list is not a PS2 list:
+
+    applewin arduous citra_canary dirksimple dolphin duckstation easyrpg flycast ishiiruka
+    melondsds pcsx2 play swanstation thepowdertoy tic80 yaps2 trident
+
+`duckstation` and `swanstation` are on it. Those are the two PlayStation cores this file has been
+recording as "never attempted" since the Beetle work, and they would arrive as a side effect. So
+the honest order is: write the CMake toolchain file first, see what falls out of seventeen cores,
+and treat PS2 as one of the answers rather than the goal.
+
+⚠ **AND TEMPER THE PS2 EXPECTATION WITH THIS FILE'S OWN ARITHMETIC.** Recorded earlier: PCSX2
+"wants an order of magnitude more CPU than this machine has, so treat it as arithmetic rather than
+porting." The measurements behind that are in this file and they are not encouraging by analogy -
+Beetle PSX needs a recompiler and its own Vulkan renderer to hold 50 fps on one saturated Jaguar
+core, and mupen64plus-next needed a GL context driver and the HLE RSP to reach 60. PS2 is a
+generation past both.
+
+**Play! is the one to try first, not PCSX2.** It is far lighter, has its own x86-64 recompiler, and
+its renderer targets can be driven by the GL context driver this port already has. PCSX2 is worth a
+build only to find out where it stops, and that answer should be written down rather than guessed.
+
+⚠ **THE THREE THINGS THIS PORT ALREADY KNOWS THAT A PS2 CORE WILL MEET.** All of them cost days the
+first time and are solved:
+
+    executable memory   this kernel refuses PROT_EXEC at map time and grants it to mprotect after.
+                        ps4/orbis_exec_mem.c, and beetle-psx's ps4/orbis_lightrec_mem.c.
+    a GL context        gfx/drivers_context/orbis_gl_ctx.c, over Mesa's EGL and zink. GLES 3.1.
+    the toolchain bugs  libc++'s ETIMEDOUT compiled against Linux's 110 on a FreeBSD target,
+                        stderr going nowhere, and ps4/orbis_profile.c for measuring instead of
+                        arguing. All three presented as a core crashing.
+
+⚠ **AND ONE RULE THAT IS NEWER THAN MOST OF THIS FILE.** For a `.sprx` entry point, presence is not
+even a call: `sceKeyboardInit()` on an unloaded module ENDS THE PROCESS rather than returning an
+error. Any new `-l<SceThing>` has to be paired with `sceSysmoduleLoadModule`.
