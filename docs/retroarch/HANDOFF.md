@@ -3197,3 +3197,553 @@ first time and are solved:
 ⚠ **AND ONE RULE THAT IS NEWER THAN MOST OF THIS FILE.** For a `.sprx` entry point, presence is not
 even a call: `sceKeyboardInit()` on an unloaded module ENDS THE PROCESS rather than returning an
 error. Any new `-l<SceThing>` has to be paired with `sceSysmoduleLoadModule`.
+
+## 2026-08-28, later — the CMake toolchain file, and what the seventeen cores actually said
+
+The previous entry said the first blocker was not PS2 but the missing CMake toolchain file gating
+seventeen cores. That is now written, all seventeen have been attempted, and **swanstation - a
+PlayStation core - builds.** The PS2 answer is in the last section and it is not the one this file
+expected.
+
+### Where the toolchain file lives, and why it is generated
+
+`ps4/build-cores.sh` writes `$WORK/orbis-core.cmake` at the start of every run, from `$ORBIS_ARCH`
+and `$C_INCLUDES`/`$CXX_INCLUDES` - the same arrays that already build `$CC_ORBIS` and
+`$CXX_ORBIS` for the make path. There is nothing to keep in step, which was the whole point: two
+descriptions of what this platform is would drift, and the second one would drift silently.
+
+⚠ **IT IS NOT `orbis-compat/cmake/ps4-openorbis.cmake`, AND MERGING THEM WOULD BE WRONG.** That
+file is for EXECUTABLES - Tempest, OpenGothic, VK-GL-CTS. It links `crt1.o` into the product,
+puts the overlay on the link line with `--whole-archive`, forces `BUILD_SHARED_LIBS OFF`, and does
+not pass `-nostdinc`. A libretro core is none of those things: its own link is EXPECTED to fail,
+and build-cores.sh collects the objects and links them against `ps4/orbis-module.ld` itself.
+
+`CMAKE_SYSTEM_NAME` is **FreeBSD**, not Generic. Generic leaves `UNIX` unset, and a libretro
+CMakeLists routinely branches on `if(UNIX)` for threading, dynamic loading and endianness - taking
+the other arm is not a build failure, it is a wrong build.
+
+### ⚠ THE FIVE TRAPS, EVERY ONE OF WHICH REPORTED SOMETHING ELSE
+
+**1. AN EMPTY TOOLCHAIN FILE IS NOT AN ERROR ANYWHERE, AND IT PASSES AS A GREEN CORE.**
+The heredoc that writes the file is UNQUOTED - it has to be, that is how the flag arrays reach it -
+so every backtick in it is live. A pair of backticks in one of its own comments turned the body
+into a command substitution and left the file ZERO BYTES. CMake reads an empty toolchain file
+happily, falls back to `/usr/bin/c++` and this desktop's headers, and builds a core for THIS
+DESKTOP. ld.lld links it and create-fself accepts it, because host and console are both x86-64.
+**The verdict was `OK` and the module was 1.5M.** The tell came one core later:
+
+    undefined symbol: std::cerr     the reference was _ZSt4cerr - libstdc++'s mangling
+                                    libc++.a defines _ZNSt3__14cerrE
+
+There is now a `grep -q CMAKE_CXX_FLAGS_INIT` guard right after the heredoc that exits non-zero.
+Anything written by an unquoted heredoc has to be looked at afterwards. The check that settles it
+on any core is `readelf -h <obj> | grep OS/ABI` - it must say **UNIX - FreeBSD**.
+
+**2. `CMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY` IS THE DOCUMENTED ESCAPE AND IT IS A TRAP.**
+It is the standard answer for a target whose link cannot run, and it configures. It is wrong twice:
+
+  * **Nothing links, so every `check_function_exists()` says yes.** A core asking whether
+    `shm_open` exists is told yes because the reference compiled. It then configures a path this
+    platform has no symbol for.
+  * **CMake feeds the EXECUTABLE linker flags to the ARCHIVER.** The static library rule is
+    `<CMAKE_AR> qc <TARGET> <LINK_FLAGS> <OBJECTS>` and llvm-ar reads a leading word as operation
+    LETTERS, so yaps2's own compiler-flag probes came out as `llvm-ar: error: unknown option n`
+    and `unknown option f` - reported as a COMPILE failure inside a try_compile.
+
+So the toolchain file gives try_compile a REAL executable link line - the SDK's crt1.o, its
+libraries, and orbis-compat's corrected `orbis-tls.ld`. Verified: a hello world links.
+
+**3. A STALE `CMakeCache.txt` SURVIVES `git reset --hard` AND `git clean -fd`.** Every core
+gitignores its build directory and clean does not touch ignored paths without `-x`.
+`CMAKE_CXX_FLAGS_INIT` is only consulted on the FIRST configure, so a cache from a previous run
+keeps the flags that run was given. Correcting the toolchain file and rebuilding changed nothing,
+twice, with identical compiler errors each time - which reads as a fix that does not work rather
+than a fix that was never applied. `rm -rf "$cbuild"` when `$KEEP -eq 0`, for the same reason the
+patch loop resets before it patches.
+
+**4. CMake LEAVES OBJECTS THAT DEFINE `main`.** Three kinds: `CMakeFiles/<version>/CompilerId*/`,
+`CMakeScratch/` and `CMakeTmp/`, and - the one that cost a link - `check_ipo_supported()`, which
+configures and builds AN ENTIRE SUB-PROJECT under `CMakeFiles/_CMakeLTOTest-C/` whose objects sit
+in a perfectly ordinary-looking `boo.dir/`. swanstation: `duplicate symbol: main`. So "it is in a
+`<target>.dir`" is NOT the test; the exclusions match a version number or an underscore-prefixed
+component under `CMakeFiles/`.
+
+**5. pkg-config IS A HOST PROGRAM AND ANSWERS WITH HOST PATHS.** `CMAKE_FIND_ROOT_PATH` has no say
+over it. yaps2 printed `Found Freetype: /usr/lib/libfreetype.so` and `Found WebP: /usr/include` -
+this desktop's, for a console build. That is the GLES-header accident one layer out, and it ends
+in a core linking a host shared object. `PKG_CONFIG_LIBDIR` REPLACES the search path rather than
+adding to it, so it is now pointed at the SDK.
+
+Also, minor but universal: **CMake 4 removed compatibility with `cmake_minimum_required(<3.5)`**,
+which most of these cores predate. `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` is on the configure line.
+
+### ⚠⚠ THE `__FreeBSD__` UNDEF IS DELIBERATE. DO NOT "FIX" IT. I DID, AND IT WAS WRONG.
+
+`$OO_PS4_TOOLCHAIN/include/c++/v1/__config` line 12 is `#undef __FreeBSD__`. clang defines it as
+12 for `--target=x86_64-pc-freebsd12-elf`, so the effect is that **a C++ TU on this platform sees
+NO platform macro at all** - not `_WIN32`, not `__linux__`, not `__APPLE__`, not `__FreeBSD__` -
+while every C TU in the same binary sees `__FreeBSD__ == 12`. The two halves of one program
+disagree about what they are running on.
+
+It looks exactly like a libc++ build artifact - a cmakedefine slot filled with a macro name it had
+no business clearing - and I wrote a shim (`include/libcxx/__config`, ahead of libc++, handing
+through with `#include_next` and putting the macro back), put it in orbis-compat, build-cores.sh
+and Makefile.orbis, and it compiled clean including the std::abs check.
+
+**It is load-bearing. It is how a libc++ built against musl is steered away from FreeBSD's arms.**
+With `__FreeBSD__` restored, libc++ takes:
+
+    __locale:35    #include <xlocale.h>          instead of  support/musl/xlocale.h
+                   - and this SDK has no xlocale.h, so 13 fatal errors
+    locale:220     #define _LIBCPP_GET_C_LOCALE 0   instead of  __cloc()
+
+⚠ **THE SECOND ONE IS THE DANGEROUS ONE AND IT DOES NOT FAIL TO COMPILE.** The prebuilt
+`libc++.a` was compiled with the macro undefined, so it uses `__cloc()`. Headers saying `0` would
+disagree with the library across the ABI boundary, in `num_get`/`num_put`. The whole shim is
+reverted; all three repositories are back to what they were.
+
+**The right fix is per-core, and it is what the swanstation patches do:** `__ORBIS__` is always
+defined here, so name it in the branch alongside `__FreeBSD__`.
+
+### What the seventeen said
+
+    OK        arduous       1.5M     thepowdertoy  4.3M     swanstation  6.3M (+2 patches)
+    LINK      trident       349o  SDL_iconv_string_REAL      SDL2 built without its own iconv
+              dirksimple     71o  luaopen_utf8               its bundled lua omits the utf8 lib
+              melondsds     175o  duplicate symbol adler32_z FetchContent builds zlib TWICE, as
+                                                             zlib.dir and zlibstatic.dir, and both
+                                                             object sets are collected
+    COMPILE   applewin           its libretro CMakeLists refuses to configure
+              easyrpg            PlayerFindPackage - missing deps
+              play               find_package(OpenGL) wants GLX, via deps/glew-2.0.0
+              yaps2              find_package(plutovg 1.1.0), and more behind it
+              flycast            find_package(OpenGL) wants GLX, CMakeLists.txt:238
+              dolphin            DolphinLibraryTools.cmake:169 - "Requires LLVM_libc++ 150000 or
+                                 higher". The SDK's libc++ is older, and that is an SDK question
+                                 rather than a core one.
+    LINK      ishiiruka     249o  glslang::InitializePoolIndex - it also wants SFML ("this
+                                 operating system is not supported"), libusb, and 64 x
+                                 'osreldate.h' file not found, which IS an overlay candidate:
+                                 a FreeBSD header the SDK omits, reached from C where
+                                 __FreeBSD__ is still defined.
+    CLONE     duckstation        THE REPOSITORY IS GONE - see below
+              pcsx2              THE REPOSITORY IS GONE - see below
+              citra_canary       submodule externals/boost cloned twice, git aborts
+              tic80              no branch 'master' - the recipe is out of date
+
+**swanstation needed two patches, both the same one-line shape**, and both are consequences of the
+`__FreeBSD__` section above rather than of anything about PlayStation:
+
+    0001  memory_arena       named __ORBIS__ so the file compiles. The arena STAYS UNIMPLEMENTED
+                             on purpose - its POSIX arm needs shm_open, which this SDK has in
+                             neither its headers nor libc.a. Create() falls through to the
+                             existing `return false`, a case the caller already handles: the arena
+                             backs fastmem, and swanstation runs without it.
+    0002  cpu_recompiler     `#error Unknown ABI.` x11, plus every register name behind that
+                             branch reported as an undeclared identifier. Not a guess: the triple
+                             is x86_64-pc-freebsd12-elf, so the convention IS System V.
+
+⚠ **NOTHING ABOUT swanstation HAS BEEN RUN ON HARDWARE.** It links, it carries `retro_run`, and
+create-fself accepted it. That is all that is known. It is also a second PlayStation core beside
+`mednafen_psx_hw`, so before it is offered in the menu, read the `PS4_CORE_DROP` comment in
+build-cores.sh about what a second name a letter apart costs a new user.
+
+### ⚠ PLAYSTATION 2: THE CORE THE RECIPE NAMES DOES NOT EXIST ANY MORE
+
+    git ls-remote https://github.com/libretro/pcsx2.git
+      -> fatal: could not read Username for 'https://github.com'
+
+That is what GitHub says for a repository that is deleted or private. **`libretro/duckstation` is
+gone the same way.** Both are still in `cores-linux-x64-generic`, so the recipe is describing a
+world that has moved. This was not knowable before the toolchain file existed, because both cores
+were being skipped for their build type and never reached a clone.
+
+So PS2 in RetroArch here is **Play!**, which is alive (`jpd002/Play-`, HEAD 04bde0d), and it stops
+at `find_package(OpenGL)` inside `deps/Dependencies/glew-2.0.0` wanting GLX. That is the same wall
+`flycast` hits, and it is a solvable one rather than a missing project: this port has GLES 3.1
+through zink and a GL context driver, and what is missing is a CMake-level answer for
+`find_package(OpenGL)`. Whoever takes it next should look at whether Play!'s libretro target needs
+glew at all, since the recipe already passes `-DBUILD_PLAY=off`.
+
+The earlier arithmetic in this file still stands and is worth repeating: PCSX2 "wants an order of
+magnitude more CPU than this machine has". Play! being the only living option is not a downgrade
+from the plan - it was already the one to try first.
+
+## 2026-08-28, evening — Play! builds, and PS2 content is on the console
+
+**`play` is `OK`, 8.3M, `04bde0d+3`.** A PlayStation 2 core. Nothing has been run on hardware.
+
+Uploaded over lftp to 192.168.100.2:2121, so there is something to test with:
+
+    /data/retroarch/system/ps2/          14 BIOS files
+    /data/retroarch/roms/ps2/            Grand Theft Auto III, 4 698 767 360 bytes, byte-exact
+    /data/retroarch/cores/               play_libretro.prx (8 625 264) and
+                                         swanstation_libretro.prx (6 528 320)
+    /data/retroarch/system/play/         created - PathUtils patch points here
+
+### What Play! needed - four things, all in ps4/core-patches/play/
+
+**`-DUSE_GLES=ON`, in core_cmake_flags().** `deps/Framework/build_cmake/FrameworkOpenGl` picks GLES
+by platform NAME - Android, iOS, ARM, Emscripten - and this console is none of them, so it took the
+desktop arm: `find_package(GLEW)`, then a bundled glew-2.0.0 doing `find_package(OpenGL REQUIRED)`
+which wants GLX. USE_GLES is the truthful answer, not a workaround: this port has no desktop GL and
+no GLX, it has GLES 3.1 through zink, which is the arm that variable selects.
+
+**0001, zlib.** Play! does not use upstream zlib's CMakeLists - it has a minimal one that compiles
+the sources directly and generates no `zconf.h`, so `Z_HAVE_UNISTD_H` is never defined, `gzguts.h`
+skips `<unistd.h>`, and gzlib/gzread/gzwrite compile with lseek, read, write and close undeclared.
+Latent on every platform; only fires on a libc that does not leak those declarations in through
+another header. glibc does, musl does not.
+
+**0002, PathUtils.** `getpwuid(getuid())`, the same `__FreeBSD__` mechanism as swanstation.
+⚠ ADDING `__ORBIS__` TO THE LINUX ARM WOULD HAVE COMPILED AND THEN CRASHED - every function there
+is `fs::path(getenv("HOME")) / …` and this console has no HOME and no XDG_*. It needed real paths.
+
+**0003, and it is the interesting one: THE PROC-ADDRESS FUNCTION DOES NOT ONLY COME FROM glsm.**
+`ps4/orbis_gl_forward.c` took it from `GLSM_CTL_PROC_ADDRESS_GET`, because every GL core so far
+used libretro-common's glsm. Play! does not - it keeps its own `retro_hw_render_callback` and calls
+the GLES core ABI directly. So the thunk table stayed null and the link wanted glTexImage2D,
+glTexParameteri and glRenderbufferStorageMultisample. Three changes in this repository:
+
+    orbis_gl_forward.c   orbis_gl_resolve_proc(getproc) split out; orbis_gl_resolve() is now a
+                         wrapper that fetches it from glsm. Plus the three entry points -
+                         ⚠ APPENDED, NEVER INSERTED: each thunk carries its slot as a LITERAL byte
+                         offset (index * 8), so alphabetical order would renumber every thunk
+                         after it. orbis_gl_slot grew 134 -> 137.
+    orbis_weak_stubs.c   a WEAK glsm_ctl returning 0. An undefined weak symbol is exactly what
+                         create-fself refuses - "missing library for symbol (glsm_ctl)" - even
+                         though ld.lld is content. Weak means a core that DOES build glsm still
+                         wins.
+    core-patches/play    0003 calls orbis_gl_resolve_proc(g_hw_render.get_proc_address) from
+                         retro_context_reset.
+
+⚠ **THE glsm_ctl STUB WAS VERIFIED BY SYMBOL, NOT BY A GREEN VERDICT**, because getting it wrong
+would be a black screen on Nintendo 64 rather than a build failure:
+
+    mupen64plus_next.elf    t glsm_ctl   local, the core's real one, 393 lines of disassembly
+    play.elf                W glsm_ctl   weak, this stub, as intended
+
+### ⚠ TWO HARNESS BUGS FOUND HERE, AND THE FIRST ONE FAKED A WORKING PATCH
+
+**`git reset --hard` AND `git clean -fd` DO NOT REACH INTO A SUBMODULE.** reset restores the
+recorded COMMIT of a submodule, not the files in one; clean skips them. Play! keeps deps/Framework
+and deps/Dependencies as submodules, so a hand edit inside either survives every reset - and
+`git diff` in the superproject records such an edit as
+
+    -Subproject commit 8a5f6b1…
+    +Subproject commit 8a5f6b1…-dirty
+
+AND NOTHING ELSE. So patch 0001 contained no change whatsoever, the build that "proved" it worked
+was reading my dirty worktree, and git apply refused it the moment the tree was clean. The loop now
+does `submodule foreach --recursive` reset and clean. A patch that touches a submodule has to be
+generated from inside it:
+
+    git -C deps/<sub> diff --src-prefix=a/deps/<sub>/ --dst-prefix=b/deps/<sub>/
+
+**BUILD THE CORE'S TARGET, NOT `all`.** A CMake tree ships tools and test suites, and their entry
+points get swept into the link: play gave `duplicate symbol: main` from CodeGenTestSuite and
+NamcoSys147NANDTools, neither of which honoured the recipe's `-DBUILD_TESTS=no`. libretro CMake
+cores name their target `<core>_libretro`, the convention this file already uses for the .prx
+filename, so that target is built when it exists and `all` is the fallback.
+
+⚠ **AND THE TARGET DETECTION WAS WRITTEN WITH `grep -q` IN A PIPELINE, WHICH THIS FILE ALREADY
+WARNS ABOUT** two hundred lines above at the retro_run check. grep -q exits on first match, cmake
+gets SIGPIPE, and under `set -o pipefail` the pipeline fails - so it answered `all` every time and
+the duplicate `main` did not go away despite the fix being correct. Capture to a variable and match
+with `[[ ]]`.
+
+### Regression, checked rather than assumed
+
+    swanstation  OK 6.3M   arduous OK 1.5M   thepowdertoy OK 4.3M   mupen64plus_next OK 5.5M
+
+## ⚠⚠ 2026-08-28, night — THIS KERNEL DOES NOT DELIVER SA_SIGINFO, AND IT HAS BEEN EATING CRASHES
+
+Loading content in Play! took the process down instantly. The dump named the instruction:
+
+    # signal: 11 (SIGSEGV)      # reason: page fault (user read data, page not present)
+    # fault address: 000000000000001a
+    # rdi: 000000089c04b900     # rsi: 0000000000000002     # rdx: 00000007ee3c7880
+    # rip: 0000000800a8bb40  ->  play_libretro.prx text 0x800864000, so + 0x227b40
+
+    227b30 <CEeExecutor::HandleException(int, __siginfo*, void*)>
+    227b39:  movq 0x529eb8(%rip), %rdi   # g_eeExecutor - loaded fine, rdi is a real pointer
+    227b40:  movq 0x18(%rsi), %rsi       # sigInfo->si_addr   <- rsi is 2, and 2 + 0x18 = 0x1a
+
+**The handler was entered correctly and handed a `siginfo_t*` of 2.** rdi = 11, a small integer in
+rsi, and a valid stack address in rdx is FreeBSD's ORIGINAL signal handler signature -
+
+    void (*)(int sig, int code, struct sigcontext *scp)
+
+- and not SA_SIGINFO's `void (*)(int, siginfo_t *, void *)`. The flag is set in the sigaction the
+core installs and does not reach the kernel.
+
+⚠ **AND THIS PORT'S OWN CRASH REPORTER MAKES THE SAME ASSUMPTION.**
+`orbis-compat/src/orbis_boot.cpp` installs `ps4SignalAction` with `SA_SIGINFO | SA_ONSTACK` and its
+first act is `info != nullptr ? info->si_code : 0`. A `code` of 2 is not null, so the null check
+passes and the read faults - inside the SIGSEGV handler, with `reentered` already set to 1, which
+goes straight to `_Exit(2)`. **The process dies silently at the exact moment it was supposed to
+explain itself.**
+
+The evidence across every log ever captured in build-ps4-logs:
+
+    "crash handlers installed ... sigaction rc=0"    present, repeatedly
+    "fatal: signal ..."                              ZERO occurrences, in any log, ever
+
+So the handler has been installed successfully and has never once produced a line. Every silent
+death this port has investigated - and there have been several - had a crash reporter that could
+not survive its own first statement.
+
+⚠ **THIS IS THE HIGHEST-VALUE THING IN THIS FILE RIGHT NOW AND IT IS NOT FIXED.** The fix belongs
+in orbis-compat, not here, and it is not a one-liner because the handler has to work out which
+convention it was called with. A handler that logs its three raw arguments and nothing else would
+settle the shape in one run; from the dump above the second argument is `code` and the third is a
+`struct sigcontext *`, whose `sc_addr`/`sc_err` fields carry what si_addr was meant to carry.
+Until then, assume ANY code in this port that reads `siginfo_t` in a signal handler is reading a
+small integer as a pointer.
+
+### Play! after that: `04bde0d+4`, uploaded
+
+Patch 0004 takes Play!'s own escape - `DISABLE_PROTECTION`, which iOS, tvOS and 32-bit ARM builds
+use - because the address the handler exists to read is the thing that never arrives, so there is
+nothing in the handler to salvage. AddExceptionHandler becomes a no-op and SetMemoryProtected
+becomes a nop.
+
+⚠ **IT IS A REAL TRADE, NOT A FREE ONE.** Writes into already-translated code are no longer
+detected by a fault, so a self-modifying game can run stale translated blocks. That is a
+correctness risk rather than a crash, and it is the same one every iOS build of Play! carries.
+
+### ⚠ IT RUNS. Grand Theft Auto III, on the console, at 3-5 fps
+
+Confirmed on hardware 2026-08-28: `play_libretro.prx` at `04bde0d+4` boots GTA III and renders it.
+That is the first PlayStation 2 content this port has ever run. It is not playable.
+
+**What is already ruled out as the cause of 3-5 fps:**
+
+    DISABLE_PROTECTION   NOT the cause, and worth stating because it looks like one. It makes
+                         SetMemoryProtected a nop, and that call is only ever mprotect - so
+                         translated blocks are invalidated LESS often, not more.
+    executable memory    probably fine. deps/CodeGen/src/MemoryFunction.cpp maps its code with
+                         mmap(PROT_WRITE | PROT_EXEC), which is exactly what this kernel refuses at
+                         map time - and its assert() is a nop in Release, so a failure would be
+                         memcpy() into MAP_FAILED and an instant crash. It renders instead, so the
+                         mapping succeeded. ⚠ NOT PROVEN, only inferred - a core that fell back to
+                         an interpreter would also render, slowly. Worth one log line.
+
+**The next measurement costs nothing and needs no build.** The core exposes
+`play_res_multi` (Resolution Multiplier; 1x|2x|4x|8x) and defaults to 1x, so the frame rate is not
+being spent on extra pixels. Set it to 2x on hardware:
+
+    frame rate barely moves   -> CPU-bound: EE/VU and the recompiler. Ask whether the recompiler
+                                 is running at all before optimising anything.
+    frame rate falls to 1-2   -> GPU/GS-bound: GSH_OpenGL through zink, a different problem.
+
+Do that before touching code. This file has paid for guessing at performance before.
+
+## ⚠ WHERE THE PS2 FRAME ACTUALLY GOES - MEASURED, SO NOBODY HAS TO GUESS AGAIN
+
+Grand Theft Auto III, on hardware, `/data/retroarch-profile` present, core `04bde0d+6`:
+
+    27 frames in 5138 ms = 5.25 fps
+      ee             177.20 ms/f   93% of wall
+      iop              8.11 ms/f    4%
+      spu              2.14 ms/f    1%
+      blockfactory     0.00 ms/f    0%      <- whole function, cache hit included
+
+**EE is the frame. Everything else is noise.** Two things fall out of that and both close a
+line of enquiry that was open for hours:
+
+  * **THE RENDERER IS NOT THE PROBLEM.** GS/GL does not even appear. This matches the hardware
+    observation that `play_res_multi` at 1x, 2x and 4x produced no measurable difference - the
+    GPU is idle enough that four times the pixels costs nothing.
+  * **THE BLOCK CACHE IS PERFECT.** `blockfactory` is 0.00 ms/f and it wraps the WHOLE function
+    including the cache-hit path, which still hashes the block with XXH3 and copies every opcode.
+    So the 178 ms is spent RUNNING translated code, not making it. Recompiler quality and cache
+    lifetime are both off the table.
+
+⚠ **AND THE OPTIMISER IS ON, WHICH WAS THE CHEAP THING TO CHECK BEFORE DRAWING CONCLUSIONS.**
+`flags.make` for PlayCore carries `-msse -msse2 -mssse3 -O3 -DNDEBUG`. A toolchain file that set
+only `CMAKE_<LANG>_FLAGS_INIT` could easily have lost `CMAKE_<LANG>_FLAGS_RELEASE`; it did not.
+
+### ⚠ SO 5 fps IS ARITHMETIC, NOT A BUG, AND THE NUMBERS AGREE TOO WELL TO IGNORE
+
+Play! needs roughly 13 ms/frame for this game on an ordinary desktop. A 1.6 GHz Jaguar is about
+14x slower than that once clock and IPC are both counted. 13 x 14 = 182 ms. Measured: 177-190.
+
+⚠ **AND Play! IS SINGLE-THREADED WHERE IT MATTERS.** `CPS2VM` starts exactly one `EmuThread`
+(PS2VM.cpp:327) and runs EE, VU0, VU1 and IOP sequentially inside it. There is no VU thread and no
+option to add one. The other five Jaguar cores cannot help without restructuring the emulator, so
+there is no easy win available here - this is the ceiling of THIS emulator on THIS machine, and
+saying otherwise would repeat the mistake this file already records twice.
+
+**The one measurement still worth taking costs nothing: run a lighter PS2 title.** A 2D or
+low-geometry game spends far less in EE, and if it runs acceptably then the port is fine and GTA
+III is simply above the machine. That is a statement about the library, not about the port.
+
+### PS2 IS PARKED, NOT ABANDONED - AND WHAT STAYS BEHIND IS DELIBERATE
+
+Decision on 2026-08-28: stop here and revisit PlayStation 2 on PS5 hardware, where the CPU
+arithmetic above stops being the whole story.
+
+⚠ **THE DIAGNOSTIC PATCH IS GONE AND THE FIVE REAL ONES STAY.** `core-patches/play/0006` measured
+where the frame went, the answer is written down two sections up, and a profiling hook has no
+business in a shipped core - it was deleted and `/data/retroarch-profile` removed from the console.
+`play` now rebuilds as `04bde0d+5`.
+
+What remains is a Play! core that boots, renders, and does not crash, plus four findings that are
+about THIS PLATFORM rather than about Play!, and which the next core to arrive will meet too:
+
+    0001  a bundled zlib that never defines Z_HAVE_UNISTD_H - latent everywhere, fires on musl
+    0002  no HOME, no XDG_*, no passwd database - path helpers need real paths, not a platform name
+    0003  get_proc_address does not only come from glsm; orbis_gl_resolve_proc() exists for that
+    0004  ⚠ THIS KERNEL DOES NOT DELIVER SA_SIGINFO - see the section above, it is the big one
+    0005  one arena for compiled code, because a mapping per basic block runs this kernel out
+
+⚠ **AND 0004 IS NOT A PS2 FINDING, WHICH IS WHY PARKING PS2 DOES NOT PARK IT.** The crash reporter
+in orbis-compat makes the same assumption and has therefore never produced a single line in any log
+this project has captured. That work is still open and still the highest-value item here.
+
+### ⚠ OPEN, AND IT IS THE SECOND TIME THIS EXACT SYMPTOM HAS APPEARED
+
+Left running, the PS2 core died after about a minute of steady play:
+
+    22:07:35   38 frames in 5130 ms = 7.40 fps        <- 5-7 fps, steady, no drift
+    22:07:50   [ScePthread/System] Internal Memory is running out.   x5
+    22:07:51   10 frames in 15829 ms = 0.63 fps       <- ee only 8% of wall now
+    22:07:51   libc++abi: terminating with uncaught exception of type
+               std::__1::system_error: mutex lock failed: Out of memory
+
+pthread_mutex_lock returned ENOMEM, std::mutex::lock threw, nobody caught it, abort(). The frame
+rate did NOT decay on the way in - it was flat until the moment the pool emptied, so whatever ran
+out did so in a step rather than a slope.
+
+⚠ **THE ARENA FROM PATCH 0005 IS PROBABLY NOT THE CULPRIT, AND THE PROFILE IS WHY.**
+`blockfactory` read 0.00 ms/f right up to the end, so almost no new blocks were being compiled and
+the arena was not growing. It would be the obvious suspect and the measurement argues against it.
+Suspect it again only with evidence.
+
+⚠ **`[ScePthread/System] Internal Memory is running out` HAS BEEN SEEN BEFORE IN THIS PROJECT** -
+on mupen64plus-next, when EnableFragmentDepthWrite exhausted the system pthread pool and took the
+console down with it. Same family: something creates synchronisation objects or threads in a loop
+and never gives them back. That is the third instance of this port's recurring shape - audio
+ports, keyboard handles, and now whatever this is.
+
+Finding it means counting what gets created per frame, which nobody has done. PS2 is parked, so
+this is recorded rather than chased.
+
+## ⚠ NEVER BUILD THE FRONTEND WITH A BARE `make -f Makefile.orbis`
+
+It compiles clean, links, packages, installs and BOOTS - and it is silently crippled. Measured
+2026-08-28 by shipping one to hardware:
+
+    only RGUI, no XMB          HAVE_VULKAN=0, so XMB/Ozone/MaterialUI/widgets are all compiled out
+                               - they draw through the video driver's texture path and RGUI is the
+                               only menu that rasterises itself
+    NO CORES AT ALL            HAVE_DYNAMIC=0, so the frontend never loads a .prx, and
+                               HAVE_STATIC_DUMMY=1 links cores/dynamic_dummy.c in their place
+
+⚠ **AND IT LOOKS EXACTLY LIKE THE CONSOLE LOST ITS CORE DIRECTORY**, which is what it was first
+reported as. /data/retroarch/cores was untouched the whole time: 36 .prx, 316 .info,
+libretro_directory correct. Nothing had been deleted. The BINARY could not load them.
+
+The line CI uses, and the only one that should ever be typed by hand:
+
+    make -f Makefile.orbis HAVE_VULKAN=1 HAVE_OPENGLES=1 \
+         HAVE_STATIC_DUMMY=0 HAVE_DYNAMIC=1 \
+         ORBIS_MESA_SRC=<mesa tree> -j<N> pkg
+
+⚠ **THE PACKAGE SIZE IS THE TELL, AND IT IS ALREADY SITTING ON THE CONSOLE AS EVIDENCE.**
+
+    ~63 MB   a correct package        every good one in /data/pkg is 63 504 384 bytes
+    ~12 MB   Vulkan and Mesa missing  and /data/pkg ALREADY held retroarchv-nomesa-20260828.pkg
+                                      at 12 517 376 - the control build from the close-hang work
+
+A package that is a fifth of the expected size is not a smaller build of the same thing. Check the
+byte count before uploading, and check the .elf: `llvm-nm retroarch_orbis.elf | grep -c xmb` must
+be non-zero and `grep -c dynamic_dummy` must be zero.
+
+## THE MOUSE WORKS, AND THE sceMouse ABI IS NOW ESTABLISHED
+
+Confirmed on hardware 2026-08-28 with a Logitech receiver: cursor moves, left and right click,
+wheel scrolls. `dosbox_pure` also builds and boots to a DOS prompt with the USB keyboard working.
+
+⚠ **NONE OF THIS ABI IS IN THE SDK.** `<orbis/Mouse.h>` declares five entry points as
+`void sceMouseOpen();` - an empty parameter list, which in C means "unspecified", not "none" - and
+no data type at all. Both the prototypes and the struct were established on hardware by
+`ps4/orbis_mouse_probe.c`, which dumps the raw bytes the call writes and watches which offsets
+move. It is file-gated on `/data/retroarch-mouse-probe` and stays in the tree, like the keyboard's.
+
+    sceMouseInit(void)                                    -> 0
+    sceMouseOpen(userId, type, index, param)              -> handle 0x008b0700, FIRST TRY
+    sceMouseRead(handle, data, count)                     -> EVENT COUNT
+    ORBIS_SYSMODULE_MOUSE = 0x00A9, and it must be loaded first
+
+The Open signature is the family's - scePadOpen and sceKeyboardOpen take the same four - and it
+was right first time. The struct, measured over 1773 reads, all counts recorded:
+
+    0x00  uint64 timestamp    rose ~16000 per read, i.e. microseconds
+    0x08  uint32 connected    constant 1 with a receiver attached
+    0x0C  uint32 buttons      0x00 x701, 0x01 x19, 0x02 x14, 0x03 x2 -> bit 0 left, bit 1 right
+    0x10  int32  x            relative, +0x11..+0x28 right, -1..-0x40 left
+    0x14  int32  y            relative
+    0x18  int32  wheel        0x01 up x13, 0xffffffff down x9
+    0x1C  int32  tilt         never moved
+
+⚠ **THE MIDDLE BUTTON WAS NEVER PRESSED in that sample, so bit 2 is HID convention and not
+measurement.** It is the one field here nobody has seen.
+
+### ⚠⚠ THE ZERO FROM sceMouseRead MEANT THREE DIFFERENT THINGS TO ME, AND ALL THREE WERE WRONG
+
+This one function cost four rebuilds, and every failure looked like a different bug:
+
+    read as "0 == success"     `if (rc != 0) return;` threw away every read that CARRIED an event.
+                               Handle opened, cursor drawn, nothing ever moved. The probe had only
+                               logged its FIRST return - 0, because the mouse had not moved yet.
+    read as "queue, ask for    Asking for 16 records and summing them made motion far coarser and
+    more"                      FASTER, not smoother: the call fills the array with the same current
+                               state, so extra records multiply the delta. Despite the name, this
+                               is a snapshot like the keyboard's ReadState.
+    read as "always has data"  Accumulating the buffer when rc == 0 re-applied the SAME delta on
+                               every idle poll. A slow hand produces mostly idle polls, so slow
+                               movement jumped while fast movement felt fine - which reads as a
+                               sensitivity problem and is not one.
+
+**rc is an event count. 0 means nothing happened and the buffer must be ignored.** Measured: over
+a whole session it returned only ever 0 or 1, with every distinct value logged once.
+
+### ⚠ TWO FRONTEND-SIDE TRAPS THE DRIVER ALONE COULD NOT FIX
+
+**The menu does not ask with RETRO_DEVICE_MOUSE.** It asks with `RARCH_DEVICE_MOUSE_SCREEN`
+(menu_driver.c:2016), which wants an ABSOLUTE pixel position, not a delta. Answering 0 pins the
+pointer at the top-left corner while buttons and wheel work perfectly. This console only reports
+deltas, so the absolute position is the driver's to keep - accumulated and clamped to the scan-out
+(gfx/drivers_context/orbis_vk_ctx.c's 1920x1080). Both device ids are handled now; a core like
+dosbox_pure reads the relative one.
+
+**`video_fullscreen` was false, which silently disables the cursor.** Every GPU menu driver gates
+it on the same expression - xmb.c:10382, ozone.c:12931, materialui.c -
+
+    cursor_visible = menu_mouse_enable && (video_fullscreen || mouse_grabbed)
+
+and this platform has no mouse-grab either, so a working driver moved the selection and drew no
+pointer. ⚠ **"not fullscreen" IS NOT A STATE THIS CONSOLE CAN BE IN** - the application owns the
+whole scan-out from sceVideoOutOpen and there is no compositor. Fixed in two places because one is
+not enough: `config.def.h` for a fresh install, and `configuration.c` right after the config load,
+because any console with an existing retroarch.cfg carries the old `false` forward and the menu
+entry that would fix it sits behind Show Advanced Settings.
+
+⚠ **AND RARCH_LOG DOES NOT REACH THE CONSOLE LOG ON THIS PORT.** A whole boot of this driver
+produced no keyboard or mouse line while ps4_log output from the same run was there. That is why
+"no mouse: open in the log" was misread as "the mouse did not open". **Anything meant to be
+diagnosable on hardware must go through ps4_log.**
+
+### Cheapest next steps, in order
+
+    melondsds     harness-side, not core-side: two CMake targets compile the same zlib sources.
+                  Deciding which .dir to prefer would probably also help other FetchContent cores.
+    play          find_package(OpenGL) - the PS2 question, and flycast comes with it.
+    trident       SDL2 built without iconv; likely one -D away.
+    tic80         the recipe's branch name is wrong; upstream renamed master.
+    --all         still GENERIC-only, on purpose. The CMAKE cores have no measured build time yet
+                  and a sweep is eight shards against a 25-minute cap. Add them to that awk line
+                  with ps4/CORE-STATUS.md weights once each has a number.
+    swanstation   run it on hardware before it goes anywhere near the index.
