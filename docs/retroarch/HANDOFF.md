@@ -3780,14 +3780,73 @@ addresses it has not backed would affect every title in this organisation, and i
 a different bug in each one. The next step is a standalone probe: allocate ~105 MB, touch every
 page, and see where it stops.
 
-### Cheapest next steps, in order
+### THE LIST, as of 2026-08-29 after v0.1.6
 
-    melondsds     harness-side, not core-side: two CMake targets compile the same zlib sources.
-                  Deciding which .dir to prefer would probably also help other FetchContent cores.
-    play          find_package(OpenGL) - the PS2 question, and flycast comes with it.
-    trident       SDL2 built without iconv; likely one -D away.
-    tic80         the recipe's branch name is wrong; upstream renamed master.
-    --all         still GENERIC-only, on purpose. The CMAKE cores have no measured build time yet
-                  and a sweep is eight shards against a 25-minute cap. Add them to that awk line
-                  with ps4/CORE-STATUS.md weights once each has a number.
-    swanstation   run it on hardware before it goes anywhere near the index.
+⚠ **THE TWO MOST VALUABLE ITEMS ARE BOTH IN orbis-compat AND BOTH AFFECT EVERY TITLE IN THIS
+ORGANISATION.** Neither is a RetroArch bug and neither will be found by working on cores.
+
+    1  SA_SIGINFO      This kernel calls signal handlers with FreeBSD's original (sig, code, scp),
+                       not SA_SIGINFO's (sig, siginfo_t*, ucontext_t*). orbis_boot.cpp reads
+                       info->si_code from what is actually `code` and dies inside its own SIGSEGV
+                       handler, with `reentered` already set, so it _Exit(2)s silently.
+                       ⚠ ZERO "fatal: signal" lines exist in any log this project has captured.
+                       Every silent death ever investigated here had a crash reporter that could
+                       not survive its first statement. A handler logging its three raw arguments
+                       settles the shape in one run.
+    2  the allocator   std::make_unique<T[]>(~105 MB) reported SUCCESS and the pages were not
+                       there - swanstation died writing into it (CPU::CodeCache::AllocateFastMap).
+                       musl's malloc goes through orbis-compat's mmap interposer, which
+                       suballocates from 128 MiB carve-outs. An allocator handing back addresses it
+                       has not backed would look like a DIFFERENT bug in every title.
+                       Next step: a standalone probe - allocate ~105 MB, touch every page, report
+                       where it stops.
+
+**Input, small and known:**
+
+    mouse middle button   bit 2 is HID convention, not measurement - it never appeared in the
+                          sample. Everything else in that struct is evidence.
+    keyboard character    input_keyboard_event gets 0, so RetroArch's own text fields take nothing.
+                          sceKeyboardGetKey2Char has a real signature; one parameter is
+                          `bool unknown`, so it is a probe rather than a guess.
+
+**Cores, cheapest first:**
+
+    tic80          the recipe names a branch upstream renamed. ⚠ NOW A ONE-LINE FIX:
+                   ps4/core-recipe-extra is searched BEFORE the recipe, so it can correct a stale
+                   line, not only add a missing core.
+    trident        SDL2 built without iconv - SDL_iconv_string_REAL. Likely one -D.
+    melondsds      FetchContent builds zlib twice (zlib.dir and zlibstatic.dir) and both object
+                   sets are collected -> duplicate adler32_z. Harness-side; would help other
+                   FetchContent cores too.
+    dirksimple     its bundled lua omits luaopen_utf8.
+    flycast        find_package(OpenGL) wants GLX. Same wall Play! hit; -DUSE_GLES=ON was the
+                   answer there, so look for the equivalent switch.
+    pcsx_rearmed   LINK on lightrec_init_mmap - executable memory, solved twice already
+                   (ps4/orbis_exec_mem.c, beetle-psx's orbis_lightrec_mem.c).
+
+**Withheld on purpose, not broken-and-forgotten:**
+
+    swanstation    builds, does not run. Four faults fixed, the fifth is item 2 above.
+    play           builds and RUNS, at 4-12 fps. Parked for PS5.
+    mednafen_psx   upstream Beetle with none of this port's work.
+
+**Older, still open:**
+
+    PrBoom Load State        does not reproduce on the host; one log line of thinkercap.next in
+                             the core settles it.
+    GLideN64 clipping        gl_Position.z /= 8.0 never scaled back. Cheap now - patch 0008 added
+                             an enableClipping knob in /data/retroarch-gliden64.
+    nestopia                 loads, runs, exits cleanly, renders a green screen.
+    GL_TEXTURE_EXTERNAL_OES  GL_INVALID_ENUM in glFramebufferTexture2D, seen on the host,
+                             pre-existing, nobody has looked.
+    coverage                 61 of 104 published cores never run on hardware.
+    pthread pool             "[ScePthread/System] Internal Memory is running out" has now appeared
+                             TWICE (mupen's depth-write option, and the PS2 core after a minute).
+                             Something creates synchronisation objects in a loop. Third instance of
+                             this port's recurring shape after audio ports and keyboard handles.
+
+**Waiting for the next release, already fixed and pushed:**
+
+    mesa-ps4 5db2def   -Dxmlconfig=disabled. RADV no longer opens the build machine's
+                       DATADIR/drirc.d at runtime. Verified: `prefix/share` is gone from the
+                       archive, WITH_XMLCONFIG=0, driconf defaults still compiled in.
