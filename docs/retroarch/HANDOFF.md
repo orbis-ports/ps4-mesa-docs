@@ -3894,6 +3894,63 @@ what is under 0x249303801 has not been established.
 is to find out what that address belongs to before changing anything - which is the step that was
 skipped last time.
 
+## ⚠ NEXT: CORES. tic80 FIRST, THEN THE CHEAP ONES, THEN ScummVM
+
+The maintainer's direction, 2026-08-29: stop chasing platform faults for a while and widen the core
+list. Take them in this order.
+
+### 1. tic80 - one line, and it proves the mechanism
+
+    tic80  CLONE  fatal: Nie znaleziono zdalnej gałęzi master
+
+The recipe says `master`. Upstream renamed it: `git ls-remote https://github.com/nesbox/TIC-80.git`
+lists clay, custom-menu, lovebyte, luajit, **main** - and no master. Nothing is wrong with the core.
+
+⚠ **ps4/core-recipe-extra IS SEARCHED BEFORE THE RECIPE, SO IT CAN CORRECT A STALE LINE AND NOT ONLY
+ADD A MISSING CORE.** That was built for dosbox_pure and has not yet been used to override
+anything - tic80 is the first test of that half. Copy the recipe's line, change master to main:
+
+    tic80 libretro-tic80 https://github.com/nesbox/TIC-80.git main YES CMAKE Makefile builddir \
+      -DBUILD_PLAYER=OFF -DBUILD_SOKOL=OFF -DBUILD_SDL=OFF -DBUILD_DEMO_CARTS=OFF -DBUILD_LIBRETRO=ON
+
+If it then builds, the sweep picks it up automatically: --all and shard-cores.sh both draw from
+GENERIC + CMAKE across the recipe AND this file.
+
+### 2. The rest of the cheap ones, in this order
+
+    trident      LINK, 349 objects, undefined SDL_iconv_string_REAL. Its bundled SDL2 was
+                 configured without iconv. Probably one -D; look at what the recipe passes.
+    dirksimple   LINK, 71 objects, undefined luaopen_utf8. Its bundled lua omits the utf8 library -
+                 either enable it or stub the one call.
+    melondsds    LINK, 175 objects, duplicate symbol adler32_z. ⚠ HARNESS-SIDE, NOT CORE-SIDE:
+                 FetchContent builds zlib TWICE (zlib.dir and zlibstatic.dir) and build-cores.sh
+                 collects both object sets. Deciding which .dir wins would likely fix other
+                 FetchContent cores too, so this one is worth more than one core.
+    flycast      COMPILE, find_package(OpenGL) wants GLX. Play! hit the same wall and the answer
+                 was core_cmake_flags() with -DUSE_GLES=ON. Look for flycast's equivalent switch
+                 before assuming it has none.
+    pcsx_rearmed LINK on lightrec_init_mmap - executable memory, already solved twice in this port
+                 (ps4/orbis_exec_mem.c, beetle-psx's ps4/orbis_lightrec_mem.c).
+
+### 3. ScummVM - wanted, and it needs a configure step this harness does not do
+
+    scummvm  COMPILE  no objects; single-shot link?
+    scummvm.log: Makefile:122: *** You need to run ./configure before you can run make.
+
+⚠ **THIS IS A THIRD BUILD SHAPE, NOT A BROKEN CORE.** build-cores.sh knows two: GENERIC runs make
+directly, CMAKE configures then builds. ScummVM is autotools-flavoured - it wants ./configure first,
+and the recipe's subdir is backends/platform/libretro/build. Nothing in the harness runs a configure
+script, so make stops on its own error message before compiling a single file.
+
+The work is in build-cores.sh, and it is the same shape as the CMAKE arm added on 2026-08-28: a
+build type that needs a preparation step, given the cross-compilation flags the arrays already
+hold. ScummVM's configure takes --host= and honours CC/CXX, so $CC_ORBIS and $CXX_ORBIS should
+reach it the same way they reach make.
+
+⚠ **AND CHECK WHAT ScummVM WANTS BEFORE BUILDING IT**: it is a large tree with optional
+dependencies, and the useful question is which subset configures at all here. A core that links is
+worth more than a complete one that does not.
+
 ### THE LIST, as of 2026-08-29 after v0.1.6 and the crash-reporter work
 
 ⚠ **THE TWO ITEMS THAT USED TO HEAD THIS LIST ARE GONE.** SA_SIGINFO is fixed and working. The
