@@ -3894,73 +3894,65 @@ what is under 0x249303801 has not been established.
 is to find out what that address belongs to before changing anything - which is the step that was
 skipped last time.
 
-### THE LIST, as of 2026-08-29 after v0.1.6
+### THE LIST, as of 2026-08-29 after v0.1.6 and the crash-reporter work
 
-⚠ **THE TWO MOST VALUABLE ITEMS ARE BOTH IN orbis-compat AND BOTH AFFECT EVERY TITLE IN THIS
-ORGANISATION.** Neither is a RetroArch bug and neither will be found by working on cores.
+⚠ **THE TWO ITEMS THAT USED TO HEAD THIS LIST ARE GONE.** SA_SIGINFO is fixed and working. The
+allocator was never guilty - the probe cleared it, and that entry was mine and wrong.
 
-    1  SA_SIGINFO      This kernel calls signal handlers with FreeBSD's original (sig, code, scp),
-                       not SA_SIGINFO's (sig, siginfo_t*, ucontext_t*). orbis_boot.cpp reads
-                       info->si_code from what is actually `code` and dies inside its own SIGSEGV
-                       handler, with `reentered` already set, so it _Exit(2)s silently.
-                       ⚠ ZERO "fatal: signal" lines exist in any log this project has captured.
-                       Every silent death ever investigated here had a crash reporter that could
-                       not survive its first statement. A handler logging its three raw arguments
-                       settles the shape in one run.
-    2  the allocator   std::make_unique<T[]>(~105 MB) reported SUCCESS and the pages were not
-                       there - swanstation died writing into it (CPU::CodeCache::AllocateFastMap).
-                       musl's malloc goes through orbis-compat's mmap interposer, which
-                       suballocates from 128 MiB carve-outs. An allocator handing back addresses it
-                       has not backed would look like a DIFFERENT bug in every title.
-                       Next step: a standalone probe - allocate ~105 MB, touch every page, report
-                       where it stops.
+**1. sigaltstack still fails, so a stack overflow still dies silently.**
+
+    boot: crash handlers installed (... sigaction rc=0, sigaltstack rc=-1 - NO alt stack ...)
+
+⚠ AND THIS IS NO LONGER EXPLAINED BY THE SA_ONSTACK VALUE. That WAS wrong - 0x08000000 where this
+kernel wants 0x0001 - and it is corrected, and rc is still -1. So sigaltstack itself is refusing,
+which is a different question and now the ONLY hole left in crash reporting: everything else
+reports, a stack overflow does not. Next step is its errno, which the boot line does not print.
+
+**2. Turn the context dump into one named line.** The mcontext layout was measured (mcontext starts
+at ctx[8]; mc_rip is ctx[28] - see the section above). Reading it out by name would replace 16 log
+lines with `fault at <rip>, module base <base>` and make every future crash a one-liner. Cheap, and
+the measurement is already done.
 
 **Input, small and known:**
 
-    mouse middle button   bit 2 is HID convention, not measurement - it never appeared in the
-                          sample. Everything else in that struct is evidence.
-    keyboard character    input_keyboard_event gets 0, so RetroArch's own text fields take nothing.
+    mouse middle button   bit 2 is convention, not measurement - it never appeared in the sample.
+    keyboard character    input_keyboard_event gets 0, so text fields take nothing.
                           sceKeyboardGetKey2Char has a real signature; one parameter is
                           `bool unknown`, so it is a probe rather than a guess.
 
 **Cores, cheapest first:**
 
-    tic80          the recipe names a branch upstream renamed. ⚠ NOW A ONE-LINE FIX:
-                   ps4/core-recipe-extra is searched BEFORE the recipe, so it can correct a stale
-                   line, not only add a missing core.
-    trident        SDL2 built without iconv - SDL_iconv_string_REAL. Likely one -D.
-    melondsds      FetchContent builds zlib twice (zlib.dir and zlibstatic.dir) and both object
-                   sets are collected -> duplicate adler32_z. Harness-side; would help other
-                   FetchContent cores too.
-    dirksimple     its bundled lua omits luaopen_utf8.
-    flycast        find_package(OpenGL) wants GLX. Same wall Play! hit; -DUSE_GLES=ON was the
-                   answer there, so look for the equivalent switch.
-    pcsx_rearmed   LINK on lightrec_init_mmap - executable memory, solved twice already
-                   (ps4/orbis_exec_mem.c, beetle-psx's orbis_lightrec_mem.c).
+    tic80          the recipe names a branch upstream renamed. ⚠ ONE LINE NOW:
+                   ps4/core-recipe-extra is searched BEFORE the recipe and can correct stale entries.
+    trident        SDL2 without iconv - SDL_iconv_string_REAL. Likely one -D.
+    melondsds      FetchContent builds zlib twice; both object sets are collected -> duplicate
+                   adler32_z. Harness-side, would help other FetchContent cores.
+    dirksimple     bundled lua omits luaopen_utf8.
+    flycast        find_package(OpenGL) wants GLX. Play! answered this with -DUSE_GLES=ON.
+    pcsx_rearmed   LINK on lightrec_init_mmap - executable memory, solved twice already.
 
-**Withheld on purpose, not broken-and-forgotten:**
+**Withheld on purpose:**
 
-    swanstation    builds, does not run. Four faults fixed, the fifth is item 2 above.
-    play           builds and RUNS, at 4-12 fps. Parked for PS5.
+    swanstation    six faults fixed, still crashes - a null during GPU_HW_Vulkan initialisation.
+                   ⚠ NEXT STEP IS TO ESTABLISH WHAT 0x249303801 BELONGS TO BEFORE CHANGING
+                   ANYTHING. Last time that step was skipped and the patch missed.
+    play           works at 4-12 fps. Parked for PS5.
     mednafen_psx   upstream Beetle with none of this port's work.
 
 **Older, still open:**
 
-    PrBoom Load State        does not reproduce on the host; one log line of thinkercap.next in
-                             the core settles it.
-    GLideN64 clipping        gl_Position.z /= 8.0 never scaled back. Cheap now - patch 0008 added
-                             an enableClipping knob in /data/retroarch-gliden64.
+    PrBoom Load State        one log line of thinkercap.next in the core settles it.
+    GLideN64 clipping        gl_Position.z /= 8.0 never scaled back; cheap via the enableClipping
+                             knob in /data/retroarch-gliden64.
     nestopia                 loads, runs, exits cleanly, renders a green screen.
-    GL_TEXTURE_EXTERNAL_OES  GL_INVALID_ENUM in glFramebufferTexture2D, seen on the host,
-                             pre-existing, nobody has looked.
+    GL_TEXTURE_EXTERNAL_OES  GL_INVALID_ENUM in glFramebufferTexture2D, pre-existing.
     coverage                 61 of 104 published cores never run on hardware.
-    pthread pool             "[ScePthread/System] Internal Memory is running out" has now appeared
-                             TWICE (mupen's depth-write option, and the PS2 core after a minute).
-                             Something creates synchronisation objects in a loop. Third instance of
-                             this port's recurring shape after audio ports and keyboard handles.
+    pthread pool             "Internal Memory is running out" seen twice. Third instance of this
+                             port's recurring shape after audio ports and keyboard handles.
 
-**Waiting for the next release, already fixed and pushed:**
+**Fixed and pushed, waiting for the next release:**
 
-    mesa-ps4 5db2def   -Dxmlconfig=disabled. RADV no longer opens the build machine's
-                       DATADIR/drirc.d at runtime. Verified: `prefix/share` is gone from the
-                       archive, WITH_XMLCONFIG=0, driconf defaults still compiled in.
+    mesa-ps4 5db2def   -Dxmlconfig=disabled: RADV no longer opens the build machine's
+                       DATADIR/drirc.d. Verified - `prefix/share` gone from the archive.
+    orbis-compat       SA_* values, and the context dump.
+    RetroArch          crash handlers wired up, module base logged at load.
