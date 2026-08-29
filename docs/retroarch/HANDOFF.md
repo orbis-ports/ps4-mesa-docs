@@ -3832,6 +3832,68 @@ The memory at 0x803f61000 EXISTS; writing to it is refused. That points at a PRO
 that was never promoted to read-write, rather than at an allocator handing back unbacked address
 space. Whoever picks up that item should start there.
 
+## 2026-08-29, evening — WHAT THE CRASH REPORTER COST AND WHAT IT BOUGHT
+
+### The tools, which are the lasting part
+
+    fatal: signal N          orbis-compat, working for the first time. See the section above for
+                             the three separate causes of its silence.
+    context dump             The kernel writes NO dump once the handler survives the signal, so the
+                             fault address used to arrive with nothing to measure it against. The
+                             handler now prints the raw context words.
+    module base at load      libretro-common/dynamic/dylib.c prints each core's retro_run address.
+                             Subtract its address in the .elf (llvm-nm) and you have the base:
+                                 0x800ae4410 - 0x274410 = 0x800870000, confirmed against a kernel
+                                 dump from the same core earlier the same day.
+    ps4/orbis_alloc_probe.c  file-gated on /data/retroarch-alloc-probe. Allocates 1..256 MiB,
+                             touches every page, reads it back.
+
+⚠ **THE mcontext LAYOUT IS FreeBSD'S AND THE SDK'S HEADERS DESCRIBE musl'S.** Do not look up
+mc_rip; measure it. From a real fault, with the context dumped as 64 words:
+
+    ctx[24] = 0x001b00130000000c   -> mc_trapno 0xc (page fault), mc_fs 0x13, mc_gs 0x1b
+                                      which puts mcontext at ctx[8]
+    ctx[25] = mc_addr    = 0          matched the reported fault address
+    ctx[28] = mc_rip     = 0x249303801
+    ctx[30] = mc_rflags  = 0x10206    a plausible flags word
+    ctx[31] = mc_rsp     = 0x7eeffa9c8
+
+⚠ **AND backtrace() IS USELESS FROM A SIGNAL HANDLER HERE - DO NOT TRY IT AGAIN.** It returns
+exactly one frame, ps4SignalAction itself: the kernel switches context to deliver the signal and
+the frame-pointer chain does not survive. The context dump is the instrument; backtrace is not.
+
+### ⚠ THE ALLOCATOR IS INNOCENT. That entry on the old list was wrong.
+
+The probe passed every size - 1, 8, 32, 64, 105, 128, 160, 256 MiB - writing and reading back every
+page with zero mismatches. malloc returns 0x2xxxxxxxx; the crash was at 0x803f61000, which is the
+MODULE. Two different address spaces, and "page not present" in the console's klog is what sent a
+day of work at the wrong one. **si_code told the truth and the klog did not.**
+
+### swanstation: six faults found, six fixed, still does not run
+
+Kept as PS4_CORE_DROP. The patches stay because five of the six are platform findings:
+
+    0001  arena implemented (bus.cpp allocates the console's WHOLE RAM through it, not fastmem)
+    0002  SysV ABI named
+    0003  JIT buffer: platform named, RW-then-mprotect, and MAP_FAILED is -1 not NULL
+    0004  ⚠ .bss OF A .prx IS NOT ALL WRITABLE. This module declares 50 MB of .bss against 259 KiB
+          of file data; s_fast_map sits ~49 MB in and needed an explicit mprotect. Any core with a
+          large .bss will meet this.
+    0005  ⚠ A 4096-BYTE GUARD PAGE ON A 16 KiB-PAGE CONSOLE. mprotect rounds the guard UP to a
+          granule, so the address the recompiler is handed lands 12 KiB INSIDE the guard. The 4096
+          assumption is everywhere and harmless until a length is reused as an OFFSET.
+    0006  fastmem teardown: InitializeFastmem returns early without calling UpdateFastmemViews,
+          and BOTH callers discard the failure - `if (... && !InitializeFastmem()) { }`.
+
+⚠ **0006 WAS WRITTEN AGAINST A MISREADING AND IS KEPT ONLY BECAUSE THE BUG IS REAL.** mc_rip was
+outside every module, so it was called recompiler-generated code. The log says the core was in
+GPU_HW_Vulkan initialisation at the time. The fix is correct; it is not this crash's cause, and
+what is under 0x249303801 has not been established.
+
+**Where it stands: a null dereference during Vulkan renderer setup, cause unknown.** The next step
+is to find out what that address belongs to before changing anything - which is the step that was
+skipped last time.
+
 ### THE LIST, as of 2026-08-29 after v0.1.6
 
 ⚠ **THE TWO MOST VALUABLE ITEMS ARE BOTH IN orbis-compat AND BOTH AFFECT EVERY TITLE IN THIS
