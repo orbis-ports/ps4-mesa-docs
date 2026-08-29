@@ -3780,6 +3780,58 @@ addresses it has not backed would affect every title in this organisation, and i
 a different bug in each one. The next step is a standalone probe: allocate ~105 MB, touch every
 page, and see where it stops.
 
+## ⚠⚠ THE CRASH REPORTER WORKS. FIRST TIME EVER, 2026-08-29.
+
+    fatal: signal 11 - SIGSEGV (bad address), si_code 2, fault address 0x803f61000
+    signal - idle, close the title with the PS button
+
+⚠ **AND MY DIAGNOSIS OF WHY IT NEVER WORKED WAS ONE THIRD RIGHT.** The evidence was sound - zero
+`fatal: signal` lines in every log this project has captured - but I read one cause into it and
+there were THREE, each sufficient on its own:
+
+    1  SA_SIGINFO was Linux's       The SDK's bits/signal.h says SA_SIGINFO 4, SA_ONSTACK
+                                    0x08000000. This kernel is FreeBSD's and reads
+                                    SA_SIGINFO 0x0040, SA_ONSTACK 0x0001, and 4 as SA_RESETHAND.
+                                    So `sa_flags = SA_SIGINFO` asked for a ONE-SHOT handler
+                                    WITHOUT siginfo, and orbis_boot.cpp's first read of
+                                    info->si_code faulted inside the SIGSEGV handler.
+                                    ⚠ SA_ONSTACK was wrong the other way, which is why the boot log
+                                    has been saying "NO alt stack" for months and blaming
+                                    sigaltstack's return code rather than the flag value.
+    2  RetroArch never called it    orbis::installCrashHandlers() has existed since the beginning
+                                    and OpenGothic calls it. RetroArch did not. Every one of those
+                                    zero lines from THIS title had the duller cause: nothing was
+                                    listening. Only the log's own prefix gave it away -
+                                    "crash handlers installed" appears as [opengothic], never
+                                    as [retroarch].
+    3  orbis_log had no sink        orbis_log.h states it: orbis_log() is "a no-op if nothing was
+                                    registered" and orbis_log_fatal() writes "or NOWHERE".
+                                    RetroArch logs through ps4_log, a different channel in the same
+                                    library, and registered neither. So the second attempt
+                                    installed the handlers correctly and STILL changed nothing
+                                    observable.
+
+⚠ **ONE SYMPTOM, THREE CAUSES, AND EACH FIX LOOKED LIKE IT HAD FAILED UNTIL THE LAST ONE LANDED.**
+That is the shape to remember: absence of evidence from a channel that was never connected proves
+nothing about the thing at the far end.
+
+The fatal sink is ps4_rarch_err_v (klog + UDP), not ps4_rarch_log_v (UDP only), for the reason
+orbis_log.h separates them: a datagram from a process the kernel is about to kill may never leave
+the machine.
+
+**Black screen after a crash is POLICY, not a fault.** orbis_fatal_action idles rather than exits -
+a title that exits gets the console's error dialog and nothing else, one that idles has already
+written its log. Close it with the PS button.
+
+### ⚠ AND IT IMMEDIATELY PAID FOR ITSELF: si_code 2 IS SEGV_ACCERR
+
+The allocator question (see the list) now has a fact it did not have. `si_code 2` is SEGV_ACCERR -
+**mapped, but not permitted** - not SEGV_MAPERR, which would be "no such page". The console's own
+klog called the same fault "page not present" and that phrasing sent me looking for missing pages.
+The memory at 0x803f61000 EXISTS; writing to it is refused. That points at a PROT_NONE reservation
+that was never promoted to read-write, rather than at an allocator handing back unbacked address
+space. Whoever picks up that item should start there.
+
 ### THE LIST, as of 2026-08-29 after v0.1.6
 
 ⚠ **THE TWO MOST VALUABLE ITEMS ARE BOTH IN orbis-compat AND BOTH AFFECT EVERY TITLE IN THIS
