@@ -670,12 +670,16 @@ this is impossible**, which is exactly what the probe concluded one rung before 
 `sceKernelMmap` both granted 0x07 as well and neither was called. On this console a granted
 protection is not an honoured one - it has charged for that distinction three times now.
 
-⚠ **`MAP_PRIVATE|MAP_ANON` is `0x1002` here, not `0x0022`.** The SDK's `sys/mman.h` is musl's and
-carries Linux's value; orbis-compat sits ahead of it in the include path and corrects it to the
-FreeBSD one. Passing the wrong value makes the kernel treat the mapping as file-backed, validate
-`fd = -1`, and return EBADF - which reads as a refusal of the protection and is nothing of the kind.
-`orbis-compat/src/orbis_mmap.cpp:53` has a `static_assert` for this. **Ask the compiler for
-constants (`clang -dM`), not a header you found with grep.**
+⚠ **`MAP_PRIVATE|MAP_ANON` is `0x1002` here, not `0x0022` - and the SDK already knows that.**
+`$TOOLCHAIN/include/sys/mman.h` is musl's and does carry Linux's `MAP_ANON 0x20`, but it ends with
+`#include <bits/mman.h>`, and `$TOOLCHAIN/include/bits/mman.h:59-62` `#undef`s `MAP_ANON` and
+redefines it as `0x1000` - the same file also corrects `MAP_SHARED`, `MAP_PRIVATE`, `MAP_FIXED` and
+the `PROT_*` set. **orbis-compat has no `sys/mman.h` and no `bits/mman.h`; it does not touch these
+constants and never did.** Passing the wrong value would make the kernel treat the mapping as
+file-backed, validate `fd = -1`, and return EBADF - which reads as a refusal of the protection and
+is nothing of the kind, so the value matters; it is simply already right.
+`orbis-compat/src/orbis_mmap.cpp:54` has a `static_assert` on `0x1002` that could not compile
+otherwise. **Ask the compiler for constants (`clang -dM`), not a header you found with grep.**
 
 The probe is `orbis_test_mirror_mapping()` in `ac_orbis_drm.c`, behind `ORBIS_TEST_MIRROR=1` for the
 safe rungs and `=exec` for the jump. It runs once at device init in any title, takes 2 MiB and gives
@@ -749,8 +753,11 @@ is the driver you meant.**
           -isystem <orbis-compat>/include   AHEAD of the SDK's include directory
           build/liborbis-compat.a           with --whole-archive
         ⚠ The include order is not a preference. The SDK ships musl's headers behind a FreeBSD
-        triple, and the overlay corrects the constants that differ - MAP_ANON among them. Put the
-        SDK first and you get Linux values for a FreeBSD kernel, silently.
+        triple, and the overlay corrects declarations that differ - four pthread types musl
+        declares smaller than Sony writes, `sa_sigaction`'s macro - by defining musl's own
+        `__DEFINED_<name>` guards before `bits/alltypes.h` is reached. Behind the SDK's directory
+        it compiles, does nothing, and says nothing. (NOT the mmap constants: the SDK's own
+        `bits/mman.h` already redefines those to FreeBSD's values - see "the MAP_ANON myth" below.)
 
     mesa-ps4/ps4/build.sh   [--host-too] [--host-orbis] [--sdk <dir>] [--work <dir>]
         no arguments   cross-build the driver for the console. This is the one that matters.
@@ -1280,9 +1287,10 @@ it, and nothing is duplicated.
 **FIONREAD was a trap, not an absence.** The SDK defines no `FION*` at all. Taking musl's would
 have been the obvious fix and would have been wrong: musl carries LINUX request numbers
 (`0x541B`) and this kernel encodes direction, length and group into the number
-(`FIONREAD = 0x4004667f`). Same shape as `MAP_ANON` being `0x0020` in the SDK's header and
-`0x1002` in the kernel. `orbis-compat/include/sys/ioctl.h` now derives them rather than copying
-them. ⚠ **Nothing in this workshop has yet called ioctl() on this console**, so these are
+(`FIONREAD = 0x4004667f`). `orbis-compat/include/sys/ioctl.h` now derives them rather than copying
+them. ⚠ This is **not** the same shape as the mmap constants, which is a comparison this file used
+to draw and which was wrong: the SDK corrects `MAP_ANON` itself in `bits/mman.h`, while it defines
+no `FION*` at all. ⚠ **Nothing in this workshop has yet called ioctl() on this console**, so these are
 reasoned, not measured.
 
 ### The remaining failure classes, each with a shape
@@ -3956,14 +3964,14 @@ worth more than a complete one that does not.
 ⚠ **THE TWO ITEMS THAT USED TO HEAD THIS LIST ARE GONE.** SA_SIGINFO is fixed and working. The
 allocator was never guilty - the probe cleared it, and that entry was mine and wrong.
 
-**1. sigaltstack still fails, so a stack overflow still dies silently.**
-
-    boot: crash handlers installed (... sigaction rc=0, sigaltstack rc=-1 - NO alt stack ...)
-
-⚠ AND THIS IS NO LONGER EXPLAINED BY THE SA_ONSTACK VALUE. That WAS wrong - 0x08000000 where this
-kernel wants 0x0001 - and it is corrected, and rc is still -1. So sigaltstack itself is refusing,
-which is a different question and now the ONLY hole left in crash reporting: everything else
-reports, a stack overflow does not. Next step is its errno, which the boot line does not print.
+**1. sigaltstack - diagnosed and repaired in the tree, NOT yet seen on hardware.** The SDK
+declares `stack_t` in Linux's field order (`ss_size` and `ss_flags` exchanged against FreeBSD's),
+so the kernel was reading `ss_size = 0` and `ss_flags = 0x10000` and answering EINVAL. Same header
+and same provenance as the SA_* defect, one field over. `orbis-compat/include/signal.h` now carries
+a layout-translating shim and `SS_DISABLE`; the boot line prints errno, a raw readback and a
+legacy-layout probe so that ONE reboot settles it either way. See the 2026-08-30 section at the end
+of this file for what each outcome will say. ⚠ Even when it works it covers the MAIN THREAD ONLY -
+FreeBSD's alternate stack is per thread.
 
 **2. Turn the context dump into one named line.** The mcontext layout was measured (mcontext starts
 at ctx[8]; mc_rip is ctx[28] - see the section above). Reading it out by name would replace 16 log
@@ -4013,3 +4021,137 @@ the measurement is already done.
                        DATADIR/drirc.d. Verified - `prefix/share` gone from the archive.
     orbis-compat       SA_* values, and the context dump.
     RetroArch          crash handlers wired up, module base logged at load.
+
+---
+
+## 2026-08-30 — the MAP_ANON myth, and what believing a header cost
+
+A claim repeated in seven places across this port was false, and today it cost a whole task: an
+agent was sent to write a `sys/mman.h` shim for a problem that does not exist.
+
+**What was believed.** "The SDK's musl `sys/mman.h` says `MAP_ANON` is `0x0020`, and orbis-compat
+sits ahead of it in the include path and corrects it to FreeBSD's `0x1000`." It appeared in
+`ps4/orbis_exec_mem.c`, `ps4/build-cores.sh`, two applied core patches, `orbis-compat/include/sys/ioctl.h`,
+`beetle-psx-libretro/ps4/orbis_lightrec_mem.c` and three places in this file. Every one of them
+reached the RIGHT conclusion - large mappings and executable pages come from direct memory here -
+for a reason that is not true.
+
+**What is true, checked two independent ways.**
+
+    $TOOLCHAIN/include/sys/mman.h:26      #define MAP_ANON 0x20     <- musl's Linux value
+    $TOOLCHAIN/include/sys/mman.h:112     #include <bits/mman.h>    <- and then this
+    $TOOLCHAIN/include/bits/mman.h:59-62  #undef MAP_ANON / #define MAP_ANON 0x1000
+
+`bits/mman.h` corrects `MAP_SHARED`, `MAP_PRIVATE`, `MAP_FIXED` and the whole `PROT_*` set the same
+way. **The SDK was already right.** And asked of the compiler under this port's own include order:
+
+    clang --target=x86_64-pc-freebsd12-elf -nostdinc \
+          -isystem $ORBIS_COMPAT/include -isystem $TOOLCHAIN/include -isystem $(clang -print-resource-dir)/include
+    -> MAP_ANON 0x1000, MAP_PRIVATE|MAP_ANON 0x1002, PROT_READ|PROT_WRITE 3
+    -> `int v = MAP_ANON;` lands in .data as 00 10 00 00
+
+⚠ **orbis-compat has no `sys/mman.h` and no `bits/mman.h` at all** - its whole `include/bits/`
+is one file, `alltypes.h`. Every comment describing the overlay as correcting these constants
+described a mechanism that has never existed. The overlay's real corrections are declarations
+(four pthread types, `sa_sigaction`'s macro) made by defining musl's `__DEFINED_<name>` guards
+early, plus headers the SDK omits - which is why the include order still matters, just not for this.
+
+**The disproof was sitting in the tree the whole time.** `orbis-compat/src/orbis_mmap.cpp:54` has
+carried `static_assert(OwnedProt==3 && OwnedFlags==0x1002, ...)` since it was written. If `MAP_ANON`
+were `0x20` that file could not compile, and it compiles in every build.
+
+**The real reason large mappings need direct memory** - the conclusion the wrong premise was
+propping up - is the **pool**, not a constant. Anonymous memory is FLEXIBLE memory: a separate,
+much smaller per-process budget that measured **427008 KiB, about 417 MiB**, at the first
+instruction of boot, shared with everything musl's malloc has ever grown into, while direct memory
+had 4601856 KiB idle at the same instant. Executable pages are additionally refused at MAP time
+(`sceKernelMapDirectMemory` with READ|EXECUTE returns `0x8002000d`, EACCES) and have to be promoted
+with `sceKernelMprotect` afterwards.
+
+⚠ **The lesson, and it is the one this file already gave once.** "Ask the compiler for constants
+(`clang -dM`), not a header you found with grep" was written here on 2026-08-23 and then quietly
+violated by every comment that quoted `sys/mman.h` without reading its last line. A header that
+ends in `#include <bits/...>` has not finished speaking. All seven sites now say what is actually
+true; nothing about the code around them changed, because the code was right.
+
+---
+
+## 2026-08-30, later — sigaltstack: the second half of the SA_* defect, one field over
+
+`sigaltstack` has returned -1 on this console since the crash reporter was written, and the boot
+line has blamed it for months. Fixing `SA_ONSTACK` (Linux's `0x08000000` where this kernel wants
+FreeBSD's `0x0001`) did not change it, which ruled out the obvious explanation and is what sent
+this search somewhere else. It did not have far to go: **the same header, the same provenance, the
+next field along.**
+
+    $TOOLCHAIN/include/bits/signal.h:91    struct sigaltstack { void *ss_sp; int ss_flags; size_t ss_size; };
+    oracles/freebsd9/sys_sys_signal.h:358  typedef struct sigaltstack { char *ss_sp; __size_t ss_size; int ss_flags; } stack_t;
+
+Twenty-four bytes either way, **`ss_size` and `ss_flags` exchanged**. `bits/signal.h` is musl's
+Linux x86_64 copy verbatim - it is the file that also carries `SA_ONSTACK 0x08000000`,
+`SA_SIGINFO 4`, a Linux `struct sigcontext` and a musl `mcontext_t`, every one of which this port
+has already had to correct or work around. The struct was simply the piece nobody had looked at.
+
+So `installCrashHandlers` filling in the obvious `ss_sp = buffer, ss_size = 65536, ss_flags = 0`
+was handing the kernel:
+
+    ss_size  = 0            (read out of the SDK's ss_flags plus its padding)
+    ss_flags = 0x00010000   (the low half of the SDK's ss_size)
+
+and FreeBSD's `kern_sigaltstack` rejects any bit outside `SS_DISABLE` with **EINVAL (22)** in a test
+that runs *before* it ever looks at the size - so the errno is EINVAL, not ENOMEM. ⚠ The struct
+layout, `SS_*`, `SA_*` and the errno numbers are **measured** from the FreeBSD 9 oracles in
+`~/src/unemups4/oracles/freebsd9/`; the *order of those two checks* inside `kern_sig.c` is
+**inferred** - that file is not among the oracles this port holds a copy of.
+
+`SS_DISABLE` is wrong the same way: the SDK says `2` (Linux), FreeBSD tests for `0x0004`.
+`SS_ONSTACK` is `1` on both. `SIGSTKSZ` is Linux's 8192 against FreeBSD's 34816 and is
+**deliberately left alone** - the kernel enforces only `MINSIGSTKSZ`, which the SDK happens to have
+right at 2048, so correcting it would only grow every `char buf[SIGSTKSZ]` in every consumer.
+
+**Two things were verified along the way and are worth keeping.**
+
+    libc.a's sigaltstack.lo has an EMPTY .text and no symbols at all - the SDK compiles a
+    sigaltstack.c that produces no code. The symbol comes from libkernel.so, so there is no
+    libc wrapper in between and nothing else to blame for the return value.
+
+    errno IS libkernel's errno, not a musl-side copy. libc.a's __errno_location.lo is a single
+    `jmp __error`, and libkernel.so exports __error. Reading errno after a libkernel-provided
+    call is therefore meaningful - which is not something to assume on this platform.
+
+**The repair is a translating shim, not a redeclared struct.** `stack_t` is typedef'd by the SDK
+header and libc++ and every prebuilt archive were compiled against it, so the type stays exactly as
+it is and only the twenty-four bytes that cross the syscall boundary are reordered
+(`orbis-compat/include/signal.h`). It is a function-**like** macro so that `struct sigaltstack` as a
+type name still means what it says; an object-like macro would have rewritten the tag too.
+`test/sizes.c` now pins both layouts, and `test/declarations.c` calls it the way a caller does.
+
+⚠ **THE CONSOLE HAS NOT CONFIRMED THIS YET, AND THE BOOT LINE IS BUILT SO THAT ONE REBOOT DOES.**
+Three lines now, and they are diagnostic in every outcome:
+
+    boot: crash handlers installed (... sigaltstack rc=<rc> errno=<n> <FreeBSD name> ...)
+    boot: sigaltstack readback rc=.. errno=.. - raw <w0> <w1> <w2> - as FreeBSD stack_t: ... - <verdict>
+    boot: sigaltstack legacy-layout probe ... rc=.. errno=..      (only printed if the first failed)
+
+The readback is the evidence and it answers the layout question **whether or not the install
+worked**, because `sigaltstack(NULL,&oss)` makes the kernel write twenty-four bytes and they are
+printed raw, decoded by nobody:
+
+    installed, FreeBSD order   w0 = the buffer   w1 = 0000000000010000   w2 = 0 or 1 (SS_ONSTACK)
+    refused,   FreeBSD order   w0 = 0            w1 = 0                  w2 = 4 (SS_DISABLE)
+    refused,   Linux order     w0 = 0            w1 = 2                  w2 = 0
+
+The position of the one non-zero word names the layout even when nothing is installed. And the
+legacy probe re-offers the same buffer in the SDK's byte order when the corrected one fails, so two
+errnos side by side separate "the layout was the problem" from "this kernel refuses the call however
+it is asked" - `ENOSYS (78)` in both would be the end of the road.
+
+⚠ **AND AN ALTERNATE STACK IS PER THREAD HERE.** FreeBSD keeps it in `td_sigstk`; `sigaction`'s
+disposition is per process. So even when this succeeds it covers the **main thread only**, and a
+core overflowing on a worker thread still dies quietly. The next step is one more 64 KiB and one
+more `sigaltstack` inside the thread start routine - deliberately not written yet, because nothing
+has observed the working case.
+
+The buffer is heap, not a static array, on purpose: a large static array on this console is a
+page-permission question of its own, and there is no reason to put the one allocation that has to
+work during a crash into the one region that needs promoting.
