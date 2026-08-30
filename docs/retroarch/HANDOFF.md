@@ -4155,3 +4155,29 @@ has observed the working case.
 The buffer is heap, not a static array, on purpose: a large static array on this console is a
 page-permission question of its own, and there is no reason to put the one allocation that has to
 work during a crash into the one region that needs promoting.
+
+### dirksimple - built, and parked for want of the right video
+
+The core builds and links (`d5d75f9+1`, one patch: upstream's CMakeLists omits `lutf8lib.c` from its
+bundled Lua source list, so `luaopen_utf8` is undefined - invisible upstream because their output is
+a `.so`). It has never been run, and will not be, because the content this port has is the wrong
+shape.
+
+DirkSimple is not an emulator. The game logic is reimplemented in Lua and ships inside the core
+(`data/games/lair`, `data/games/cliff`); the only thing it needs from outside is an Ogg Theora
+encode of the laserdisc footage, named `lair.ogv` or `cliff.ogv` - the filename is what selects the
+script.
+
+⚠ **AND IT MUST BE ONE CONTINUOUS VIDEO.** `game.lua` seeks by absolute time into a single stream:
+
+    local start_time = scene_manager.current_sequence.start_time
+    DirkSimple.start_clip(start_time)
+
+223 KB of such markers, all calibrated against the original uncut footage. The CD-ROM release
+(`DL_CDROM_V31.ISO`) stores the game as ~200 per-scene MPGs - `S35.MPG`, `S35B.MPG`, `S35D1.MPG` and
+so on. Concatenating them would produce a video in which not one marker lands where the script
+expects: the game would run and play the wrong scenes, which is worse than not running. Upstream's
+README names the Digital Leisure DVD as the source, and that is a single continuous file.
+
+Maintainer's call, 2026-08-30: not worth chasing for one game that is playable by other means. The
+core stays built and unpublished until someone has the DVD encode.
