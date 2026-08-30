@@ -4181,3 +4181,102 @@ README names the Digital Leisure DVD as the source, and that is a single continu
 
 Maintainer's call, 2026-08-30: not worth chasing for one game that is playable by other means. The
 core stays built and unpublished until someone has the DVD encode.
+
+## 2026-08-31, overnight - four results, and two briefs that were wrong
+
+### A second eboot that speaks desktop OpenGL
+
+`glcaps/eboot.bin` had been built months ago and never run. Run on hardware 2026-08-30:
+
+    CEILING: OpenGL ES 3.1; desktop GL context CREATED
+    OpenGL 4.6 / 4.5   eglCreateContext refused (0x3009)
+    OpenGL 3.3         OK -> 3.3 (Core Profile) | GLSL 3.30 | 226 extensions
+    OpenGL 2.1         OK -> 3.3 (Compatibility Profile) | 304 extensions
+    OpenGL ES 3.1      OK | 157 extensions
+
+⚠ **A laptop probe against a drm-shim had said 4.6.** Hardware says 3.3. The shim executes no GPU
+work and is optimistic by a step - it also claimed GLES 3.2 where the console gives 3.1. Anything
+measured on the shim is an upper bound.
+
+`RTRG00001` / *RetroArchG* is now a separate product built from the same tree by flags alone
+(`HAVE_OPENGL_CORE=1` instead of `HAVE_OPENGLES=1`), living in `/data/retroarch-glcore/` so the two
+cannot fight over `retroarch.cfg`'s `libretro_directory`. Mesa needed no changes at all: `-Dopengl=true`
+was already set and all 2312 desktop entry-point stubs were already inside the `libgallium-*.a` the
+eboot links - they were simply unreachable by name.
+
+⚠ **Two things in the brief were wrong and the work disproved them.** The frontend link gap is *zero*
+symbols, not one: `gl2.c`'s `glGetTexImage` sits behind `#if defined(READ_RAW_GL_FRAME_TEST)`, which
+nothing defines. And the core-side thunks belong to mupen64plus_next, not melonDS DS - six of them
+(`glFinish`, `glGetFloatv`, `glGetString`, `glPolygonMode`, `glClearDepth`, `glDepthRange`), because
+glsym covers GL 2.0+ and the GL 1.x entry points become plain link-time symbols on the desktop path.
+melonDS DS needs none; it resolves its whole GL surface through `rglgen_resolve_symbols`.
+
+⚠ **And a harness defect that would have silently eaten the thunks**: `liborbis-core-support.a` was
+rebuilt on `[[ ! -f ]]` alone, so every cached core would have linked the old archive. It now rebuilds
+when its sources change.
+
+**Untested, and this is the honest risk**: a desktop context has never been *presented* here. glcaps
+created one, read two strings and destroyed it without drawing a frame. Everything past
+`eglMakeCurrent` is unexercised - zink's core-profile path, `gl3.c`'s SPIR-V filter chain over
+`GL_ARB_gl_spirv`, kopper's swapchain under a non-ES context. GLideN64's 60.41 fps was measured on
+the GLES *compatibility* path; the glcore build of that core is a different renderer and its frame
+rate is an open question, not a carried-over result.
+
+### An alternate signal stack on every thread, not just the main one
+
+`sigaltstack` on the main thread was fixed and confirmed on hardware the same night (the SDK's
+`struct sigaltstack` has `ss_size` and `ss_flags` swapped against FreeBSD's). FreeBSD keeps the stack
+in `td_sigstk`, **per thread**, so worker threads were still dying silently.
+
+Now every thread gets one, and ⚠ **including a core's own threads, which was not expected**:
+`ps4/build-cores.sh` puts `-lorbis-compat` ahead of `-lc` on every core's link line, so a core that
+calls `pthread_create` has an undefined reference and pulls the interposer in. Measured: **63 of 119
+built cores define `T pthread_create` themselves**, flycast and melondsds among them. Each core gets
+its own instance with its own counters and an unregistered log sink, so its installs are silent - but
+they work, because what they set is the kernel's `td_sigstk` and the handler that runs on it is the
+frontend's. `sigaction`'s disposition is per process; that cross-module split is why this works.
+
+Cost: **zero new memory.** The 64 KiB is an array in the thread trampoline's own frame, carved out of
+the 2048 KiB the interposer already reserves. Skipped below a 256 KiB stack.
+
+The first worker thread now prints what it *inherited*, which settles a question the oracles cannot:
+whether this kernel copies `td_sigstk` on thread creation. If `ss_sp` reads back as the main thread's
+buffer, threads have been sharing one alternate stack all along.
+
+### A crash dump was going out over UDP alone
+
+    real SIGSEGV, 2026-08-30 23:27:04
+      ps4-udp-*.log    4 lines of "fatal:"
+      ps4-klog-*.log   0 lines, in a 14252-line file
+
+`ps4_log()` stopped being a klog channel when orbis-compat introduced `klogWanted()`
+(`s_frameKlog || orbis_netlog_ready()==0`, false on any console whose netlog came up), so both
+branches of `ps4_log_emit` had been writing to the same channel. `include/ps4_app.h` still documented
+`ps4_log` as "both channels", and this port's code was written against that stale comment. The dump
+was legible that night only because `ps4_idle_forever()` held the process open - which is the exact
+scenario the two-channel split exists for. Fatal lines now go through `ps4_log_fatal()`, which writes
+`sceKernelDebugOutText` first and unconditionally. Bounded cost: 9 `[ERROR]` lines in one measured
+run, 0 in another, plus 4-6 of dump. `[WARN]` stays on UDP - 55 lines a run would cost ~0.6 s.
+
+### swanstation's 0x249303801 - it is the heap, and the answer was already in the log
+
+⚠ **The instruction to identify the address before patching was right, and the identification needed
+no new instrument.** When the shell killed the hung process 42 seconds after the fault, the kernel
+wrote its own `# dynamic libraries:` dump - every image with exact extents - and nobody had read it.
+
+    swanstation .prx   text 0x800870000 : 0x800e04000   data ... : 0x804068000
+    eboot.bin          text 0x000400000 : 0x003bac000
+    0x249303801        in NO image at all
+
+What lives at `0x2xxxxxxxx` is stated by the frontend's own banner: the direct-memory carve-outs
+`orbis_mmap.cpp` serves musl's anonymous mappings from. The arithmetic pins it 127 MiB into carve-out
+0 - the heap. And `mc_err = 4` decodes as user-mode, **read**, page-not-present, with the
+instruction-fetch bit **clear** and `mc_addr` = 0: the fetch at `0x249303801` succeeded. **Control had
+already been transferred into a heap allocation and was running there** - a wild indirect branch
+through a stale function pointer or vtable, not a call through null.
+
+⚠ **And the recorded symptom is no longer trustworthy.** That run shows `ran 18 global constructor(s)`
+**three times in 1.5 seconds**, with `vulkan: destroying the context` between the loads. Re-running 18
+constructors over a live image re-initialises globals underneath pointers other globals still hold -
+a mechanical route to exactly this fault. Both defects were fixed on 2026-08-30. Reproduce before
+analysing further; the core builds clean as `7f69c19+6` against today's tree.
