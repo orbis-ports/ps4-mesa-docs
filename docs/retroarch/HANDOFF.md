@@ -4659,3 +4659,45 @@ context lines in `orbis_gl_ctx.c` use it.
 
 Shipped: `retroarchG-order2-20260831.pkg` and `retroarchv-tess46-20260831.pkg`, both against the
 22:31:14 driver.
+
+### 2026-08-31, GL 4.6 confirmed on hardware - and two claims above are retracted
+
+The host-side UDP netlog has the whole evening. Eight runs at 3.3, then:
+
+    21:36  [PS4] desktop GL 3.2 core context created.
+    21:36  [PS4] GL context is: 3.3 (Core Profile) Mesa 26.3.0-devel (git-853b0708c7) | GLSL 3.30
+    22:03  [PS4] GL context is: 4.6 (Core Profile) Mesa 26.3.0-devel (git-a4351f4c68) | GLSL 4.60
+    22:25  [PS4] GL context is: 4.6 (Core Profile) Mesa 26.3.0-devel (git-0552ea5e2f) | GLSL 4.60
+
+**GL 4.6 core, GLSL 4.60, and the core sees it too** - those version lines are `[libretro INFO]`,
+the core's own `glGetString`, not the frontend's.
+
+⚠ **And the context is still created by asking for 3.2.** `[HW] Requesting core OpenGL context (3.2)`
+on every one of those runs; EGL returns the highest version compatible with the request. So the
+`{4,6,1}` and `{4,5,1}` rungs added to `orbis_gl_ctx.c` never fire. Removing the clamp is still
+right - a core that asks for 4.1 is now passed through instead of silently rewritten to 3.3 - but
+the rungs above it are insurance, not the mechanism.
+
+### ⚠ Retraction 1: the tess46 package was not the first to carry tessellation
+
+Recorded above: "the first package built after the fix did not contain it", on the evidence that the
+Mesa archive grew 36,209,554 -> 36,217,692 bytes across a rebuild. **That growth was this session's
+own ledger instrumentation** - `orbis_lg_next[]` and the chain print, added between the two builds -
+not the tessellation ring. The 22:03 run already reported GL 4.6 from `git-a4351f4c68`, which is the
+commit *before* the tessellation commit, with the fix uncommitted in the working tree. Any build from
+about 22:00 onward carried it.
+
+The habit is still worth keeping. The inference was not: **a size change proves something changed,
+never what changed.** The build stamp names the time; only a string that exists in exactly one of the
+two versions names the content.
+
+### ⚠ Retraction 2: the GL version line did survive
+
+Recorded above: "the run that was supposed to confirm GL 4.6 could not be read for it afterwards".
+It could. `log-receiver.py` had been running since 19:45 and wrote every `RARCH_LOG` line to
+`build-ps4-logs/ps4-udp-20260831-194520.log` on the host. The line was on disk the whole time, on the
+*other* machine, and the search for it went through the console's filesystem only.
+
+`orbis_watchdog_note()` stays: a fact on the console's own disk does not depend on a receiver that
+happened to be up, and the netlog *has* been lost before. But it was not needed here, and the claim
+that the evidence was gone was false.
