@@ -4508,3 +4508,67 @@ another round on it.
 And **"per second" is excluded from data already on disk**: in `gl12.log` presents per window fell
 154 -> 47 (~31 fps to ~9 fps) across fifteen consecutive reports while B/frame stayed at exactly
 9,280 throughout.
+
+### 2026-08-31, later still - the frontend's own code is exonerated, and the bytes are all in the GL path
+
+The ledger now marks three boundaries inside RetroArch (`runloop_iterate`, `runloop_check_state`,
+`video_driver_frame`) and two either side of `eglSwapBuffers`. One menu-navigation run, two reports,
+the second one leaking at **8,091 B/frame**. The segments, since the previous report:
+
+    present:exit..(next mark)                      4720 B/frame   1068 B/ms
+    video_frame..(next mark)   THE MENU'S GL       1795 B/frame    483 B/ms
+    vkAcquire..vkQueueSubmit2                       904 B/frame    249 B/ms
+    eglSwap:enter..(next mark)                      522 B/frame    115 B/ms
+    SubmitDone..flip_slot                            83 B/frame     24 B/ms
+    check_state..video_frame   INPUT+MENU+WIDGETS    37 B/frame      8 B/ms
+    flip_slot..copy                                  26 B/frame      8 B/ms
+    runloop_iterate..check_state                      0 B/frame      0 B/ms
+    eglSwap:returned..runloop_iterate                 0 B/frame      0 B/ms
+    present:enter..gpu_idle, gpu_idle..SubmitDone   0-1 B/frame      0 B/ms
+    winsys submit:enter..GnmSubmit, submit:exit..     0 B/frame      0 B/ms
+
+They sum to 8,088 against a reported 8,091, and the twelve times sum to 43.4 ms - one frame at the
+~23 fps the console had degraded to. So the chain is complete and the columns are a partition.
+
+⚠ **RetroArch's own code spends 37 bytes a frame.** `runloop_iterate..check_state` and
+`eglSwap:returned..runloop_iterate` are both exactly zero, cumulatively as well as in the delta.
+Input polling, menu logic, menu widgets, the task queue, audio and timing are **out**. That was the
+one distinction the whole instrument was built to draw, and it came back clean on the first run.
+
+Everything left is inside the GL path or Mesa's swap.
+
+### ⚠ But the segment NAMES no longer describe what was measured, and that must be settled before the
+### 4,720 is attributed
+
+A segment is really "this mark .. whatever came next", and the names were written when there were ten
+marks. Five more went in above EGL, three of them *inside* the window the largest segment is named
+after. `present:exit..vkAcquire (frontend between frames)` cannot still be the frontend between frames
+when `runloop_iterate`, `check_state` and `video_frame` are now marked and carry 37 bytes between them.
+
+Two chains fit the numbers, and they disagree about where the 4,720 is spent:
+
+- if `vkAcquire` fires inside `kopperSwapBuffers` after the present, it is **kopper's post-present
+  acquire**, and `video_frame..(next)` 1795 is the menu's GL drawing up to that acquire;
+- if `vkAcquire` fires lazily on the next frame's first draw (which is what kopper normally does),
+  the 4,720 is **the tail of `kopperSwapBuffers` after the winsys present returns**, and the 1,795 is
+  the drawing up to the acquire it triggers.
+
+Reading the label instead of the order is precisely how the four retracted coefficients happened. So
+`orbis_ledger_mark` now records the **observed successor** of every mark and prints the chain once:
+
+    orbis-drm: OBSERVED MARK ORDER, one frame: <name> -> <name> -> ... -> (wraps)
+
+Recorded as `id + 1` so that a zero-initialised slot reads as "never followed" rather than as id 0,
+which is a real mark. No extra meter reads; the perturbation is unchanged.
+
+### Also from this run
+
+- **`draws/frame` and `bytes/draw` now divide by the right thing.** RADV counts a draw on every frame
+  while the ledger weighs bytes on one frame in eight; dividing the first by the second read eight
+  times too many draws a frame. Fixed before this build shipped - `draws/frame` divides by frames
+  *seen*, and `bytes/draw` is composed from the two rates rather than from raw totals.
+- 72 draws/frame in the quiet report, **62 in the leaking one** - fewer draws, twenty-three times the
+  bytes (349 -> 8,091 B/frame). Per-draw is not looking likely, but one pair of points is not a result;
+  the next run should navigate between menu views that differ more sharply in draw count.
+- The quiet report is not zero either: **349 B/frame**, 296 of it in `eglSwap:enter..(next)`. Whatever
+  switches on multiplies something that was always there.
