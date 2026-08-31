@@ -4701,3 +4701,54 @@ It could. `log-receiver.py` had been running since 19:45 and wrote every `RARCH_
 `orbis_watchdog_note()` stays: a fact on the console's own disk does not depend on a receiver that
 happened to be up, and the netlog *has* been lost before. But it was not needed here, and the claim
 that the evidence was gone was false.
+
+### 2026-08-31, the Vulkan run - flat, and it hands over the sharpest clue yet
+
+`retroarchv-tess46-20260831.pkg`, melonDS, netlog:
+
+    22:39:06.055  libkernel internal memory at startup: 14013568 bytes free
+    22:39:06.599  14004288 free (-9280 since the last line, 9280 below startup)
+    22:39:54.870  14005728 free (+1440 since the last line, 7840 below startup)
+    22:39:59.914  14003008 free (-2720 since the last line, 10560 below startup)
+
+**No sustained leak** - a minute in, 10,560 bytes below startup, and the meter went *up* by 1,440 in
+between. That is the third run to say the Vulkan driver does not do this.
+
+⚠ **But 9,280 leaves the pool once, here too.** Exactly 9,280, once, in a run that then stays flat.
+The handoff has recorded that startup appearance since the beginning without doing anything with it.
+It is worth doing something with now: **the same constant appears once at startup in every run this
+port has ever captured, and once per frame under glcore.** One allocation that normally happens a
+single time, being repeated, fits every measurement taken so far - it is not page-granular, it is
+above the winsys, it is not per-draw, it is not time-based, and it switches on rather than ramping.
+
+### ⚠ Every probe written so far weighs USE. None weighs CREATION.
+
+The pool is libkernel's **ScePthread** internal memory (technote 235). The candidates weighed to zero
+- lock, unlock, an expired timed wait, two clock reads, a sleep, `sceVideoOutGetFlipStatus`, malloc,
+mmap - all operate on a primitive that **already exists**. Nothing has ever measured what it costs to
+bring one into existence, which is the single thing a pool named after pthreads would charge for.
+
+Added to `orbis-compat/src/orbis_mem.cpp`:
+
+    mutex init+destroy          2000x
+    cond init+destroy           2000x
+    rwlock init+destroy         2000x
+    thread create+join            50x   (milliseconds each; 2000 would read as a hang)
+    mutex init, NO destroy       256x   (does destroy give it back?)
+    cond init, NO destroy        256x
+
+A matched pair reads zero unless creation costs something destruction does not return; the unmatched
+halves separate "expensive" from "never given back". All of it runs **at startup, before any leak**,
+so it sidesteps the constraint that a run cannot come back from switch-on.
+
+Shipped as `retroarchG-create-20260831.pkg`. `ORBIS_INTERNAL_MEM_PROBE=1` is already in
+`/data/retroarch-glcore-env.txt`.
+
+### Also in that run, and unresolved
+
+`retro_run entries` froze at **403** while the run loop kept moving - `the run loop is MOVING (seq
+18027) but retro_run has not been entered for 51261 ms`, every five seconds, phase
+`video:driver_frame`. This is what an open menu looks like from the watchdog's side, and that is the
+likely explanation; it is not distinguishable from a genuine stall in the log, which is itself a
+defect in the watchdog. Alongside it, audio ran at **100% underrun** - `1875 underruns in 1875
+grains, rc=256`, repeating - which is also what a paused core would produce.
