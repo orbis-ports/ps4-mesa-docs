@@ -4367,3 +4367,103 @@ now works here, and this handler only rewrites code and returns - it never modif
 which this kernel ignores anyway. Fastmem is plausibly recoverable as a performance project.
 
 ⚠ **swanstation is still in `PS4_CORE_DROP` and will not ship until that is changed.**
+
+## 2026-08-31 - the internal-memory leak: what is established, and four coefficients that were not
+
+⚠ **STATE: NOT FIXED. The spending is located, not named.** Read this whole section before touching it;
+most of a day went into hypotheses that fit the data and were wrong, and they are recorded here so
+nobody re-derives them.
+
+### The symptom
+
+`[ScePthread/System] Internal Memory is running out.` - thousands of lines, and on two occasions the
+console-wide UI froze and needed a cold reboot. Seen four times before today (HANDOFF records audio
+ports and keyboard handles); this is the first time it was measured.
+
+### The meter
+
+`sceKernelInternalMemoryGetAvailableSize` reads **14,013,728 bytes free at startup** and 96 bytes at
+the failure. It is exported by the SDK's `libkernel.so` stub, undeclared in any header, so it is
+called through a **weak** symbol with a dual-calling-convention guard (`ps4/orbis_watchdog.c`).
+⚠ `[ScePthread/System]` is the logging *category*, not the owner: mutex, condvar, attr and thread
+creation all keep working while this pool empties. The name led two rounds astray.
+
+### What is established, all on hardware
+
+- **9,280 bytes per frame, to the byte**, for ten consecutive 120-frame reports, stable across three
+  different builds of the instrument. The same 9,280 also appears **once** at startup in every run
+  this port has ever captured.
+- ⚠ **It switches on.** Flat for the first several hundred frames, then never recovers. In `gl4.log`
+  it began at the **sixth RADV device instance** - RetroArch tears the device down and recreates it
+  on content load and on menu-driven driver reinit. Never observed before that point.
+- **It is not page-granular** in either size: 9280/4096 = 2.27, 9280/16384 = 0.566. So it is heap
+  bookkeeping, not address-space bookkeeping - which retires the whole `sceKernelInternalGetMapStatistics`
+  family the export names had suggested.
+- **The frame ledger locates it above this driver.** Ten marks, each segment bounded by exactly one
+  call, time booked beside bytes:
+
+      present:exit..vkAcquire (frontend between frames)   7190 B/frame  in 9764 us = 736 B/ms
+      vkAcquire..vkQueueSubmit2 (DRAWS + ZINK + RADV REC) 1883 B/frame  in 9339 us = 201 B/ms
+      everything inside our winsys                        0-73 B/frame            = 0-8 B/ms
+
+  Every segment spans a comparable 8.0-9.8 ms and they differ ~100x in cost, so **the cost is not
+  time-based** and 9,073 of the 9,280 bytes are above the winsys.
+- **It is glcore-only.** RetroArch's Vulkan driver draws the same menu with a reset-per-frame buffer
+  chain and pools that are never freed; its per-frame churn is ~0 and it does not leak on the same
+  hardware. The glcore build draws everything through zink.
+
+### ⚠ Four coefficients that fit the data and were all artifacts
+
+Each was derived by dividing a window total by a correlated aggregate, each held for several runs:
+
+    146 bytes per syncobj timeout   - the split counter halved the divisor and the coefficient
+     73 bytes per syncobj poll      - poll rate fell 2.7x, per-frame loss did not move
+    ~10 KB per frame                - two windows, same present count, 6.6x different loss
+    73 bytes per clock_gettime      - 96 bytes over 2000 calls in isolation: noise
+
+**The lesson is not a better divisor. It is to stop dividing** - which is what the ledger does.
+
+### Measured at zero, on hardware, in isolation (2000 calls each)
+
+`clock_gettime` MONOTONIC and REALTIME, `pthread_mutex` lock+unlock, `sceKernelUsleep(1)`,
+`pthread_cond_timedwait` already-expired, **`sceVideoOutGetFlipStatus`**. ⚠ A clean sheet under a
+tight loop from one thread is not innocence under the driver's conditions - but combined with the
+ledger's B/ms it is now enough to exclude our own paths.
+
+### Also established, and worth its own line
+
+- **zink polls fences 60-162 times a frame** against **one `vkWaitForFences` per frame**. Those polls
+  are driver-internal and their caller has never been named. The deadline they pass is
+  microseconds in the past, not decades, so it is a caller with no patience - not a clock-base bug.
+  `orbis-drm` now counts polls and real timeouts apart.
+- **`sceKernelInternalHeapPrintBacktraceWithModuleInfo` produced nothing readable** when fired twice
+  (before the leak and at a fifth of the pool). Either it writes somewhere other than klog or it is
+  a stub here.
+
+### Next
+
+Naming the allocation now needs instrumenting **zink or the frontend**, not the winsys. Cheap tests
+proposed and not yet run: a null core, or the menu with its shader chain disabled, to see whether the
+9,280 tracks draw count rather than frames.
+
+## 2026-08-31 - two build-system defects that cost four hardware rounds
+
+⚠ **`Makefile.orbis` did not relink the frontend when Mesa changed.** `$(RADV_ARCHIVE)` reaches the
+link through `$(LIBS)`, which make cannot see, so `make pkg` reported success and packaged the
+**previous** driver. Four rounds of "the fix did not take" were four rebuilt Mesas that never reached
+the console. Fixed in `149d4df1ef`; the ELF now depends on the archive.
+
+⚠ **And ccache made the log agree with the wrong answer.** `ac_orbis_drm.c` prints `__DATE__ __TIME__`
+as its build stamp; ccache served a cached object and the stamp stayed frozen at the old build, so the
+console log confirmed a driver that was not running. **Two independent things saying "unchanged" is
+what let this survive.** When checking which build ran, check a string that only the new code has.
+
+⚠ **The two eboots were truncating each other's Mesa log.** Both read `/data/retroarch-env.txt`, so
+both took the same `MESA_LOG_FILE`, and Mesa opens it with `fopen(path, "w")`. Whichever launched
+last erased the other's log - which is how "the glcore build produces no Mesa output" was measured
+when it had been producing plenty. glcore now reads `/data/retroarch-glcore-env.txt` (`e037d22651`).
+
+⚠ **And a diagnostic that only speaks to a listener is a diagnostic for the runs that did not need
+one.** A whole run's watchdog output was lost because the maintainer's log receiver had dropped, and
+the netlog and klog captures come from one script - losing it loses both. `ps4/orbis_watchdog.c` now
+writes every line to `/data/retroarch-watchdog.log` as well.
