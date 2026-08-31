@@ -4327,3 +4327,43 @@ it. Wrong, and the source says so plainly: `zink_screen.c:877` sets `caps->doubl
 unconditionally, and `st_extensions.c:1699` derives `ARB_gpu_shader_fp64` from that cap - so the
 Vulkan bit cannot gate it. `shaderFloat64` gates only the subgroup caps, which no GL 4.x rung
 requires. The probe reports `shaderFloat64=1` on this hardware anyway.
+
+## 2026-08-31 - swanstation runs. The bug was a header arm that does not exist here
+
+**30-90 fps at 2x upscale with 2xMLAA**, measured by the maintainer. This core had been withheld from
+every release (`PS4_CORE_DROP`) since the first sweep.
+
+The whole failure was one `#if`. `src/common/page_fault_handler.cpp` defines `USE_SIGSEGV` for
+`__linux__ / __ANDROID__ / __APPLE__ / __FreeBSD__` and nothing else. ⚠ **`__FreeBSD__` is undefined
+in every C++ translation unit on this SDK** - libc++'s `__config` does `#undef __FreeBSD__`, which
+this port discovered while building trident - and no arm names `__ORBIS__`. So `InstallHandler()`
+reached `#else return false;` with no way to succeed, and from there:
+
+    InitializeFastmem() fails
+      -> Bus::UpdateFastmemViews() never runs
+      -> m_fastmem_lut (a 16 MiB calloc) is NEVER ALLOCATED - not a failed allocation, never asked for
+      -> Bus::GetFastmemBase() returns nullptr
+      -> g_state.fastmem_base stays null
+      -> but g_settings.cpu_fastmem_mode is STILL LUT, so the recompiler keeps emitting
+         EmitLoadGuestRAMFastmem, whose RBX comes from that null base
+
+Which is exactly what the crash instrument caught in the generated code:
+
+    movl  $0x93C, %edi          ; guest address
+    shrl  $12, %edi             ; page index -> 0
+    movq  (%rbx,%rdi,8), %rdi   ; rip here, rbx = 0, fault address 0
+
+⚠ **And patch 0006 had fixed the wrong variable.** It cleared `Bus`'s copy of the mode and re-derived
+`g_state.fastmem_base` from it - setting to null a value that was already null - while the emitter
+asks `g_settings`. That is why the identical crash survived it, and why the coordinator's note at the
+time ("0006 fixes a real bug but not that crash") was right for the wrong reason.
+
+Patch 0007 forces `cpu_fastmem_mode = Disabled` in `FixIncompatibleSettings`, two lines below the
+`#ifndef WITH_MMAP_FASTMEM` downgrade upstream already does there, so it runs on the initial load and
+on every core-option change, before the code cache is (re)initialised.
+
+**Worth doing later, not needed now**: an `__ORBIS__` arm in `page_fault_handler.cpp`. `SA_SIGINFO`
+now works here, and this handler only rewrites code and returns - it never modifies the ucontext,
+which this kernel ignores anyway. Fastmem is plausibly recoverable as a performance project.
+
+⚠ **swanstation is still in `PS4_CORE_DROP` and will not ship until that is changed.**
