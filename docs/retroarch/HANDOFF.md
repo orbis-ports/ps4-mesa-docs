@@ -4280,3 +4280,50 @@ through a stale function pointer or vtable, not a call through null.
 constructors over a live image re-initialises globals underneath pointers other globals still hold -
 a mechanical route to exactly this fault. Both defects were fixed on 2026-08-30. Reproduce before
 analysing further; the core builds clean as `7f69c19+6` against today's tree.
+
+## 2026-08-31 - what caps this console at GL 3.3 is one bit, and it is ours
+
+Measured by the extended `glcaps` probe on hardware:
+
+    GL 4.0  MISSING 1 of 11 extensions:
+            GL_ARB_tessellation_shader
+    GL 4.1  all 9 requirements present
+    GL 4.2  all 9 requirements present
+    GL 4.3  all 16 requirements present
+    GL 4.4  all 6 requirements present
+    GL 4.5  all 7 requirements present
+    GL 4.6  all 9 requirements present
+    FIRST BLOCKER: GL 4.0. Everything below it is satisfied.
+
+⚠ **Every rung above 4.0 is already complete.** Nothing else is missing anywhere in the ladder, so if
+tessellation worked this port would go from 3.3 to **4.6** in one step - and from ES 3.1 to ES 3.2,
+because tessellation is an ES 3.2 requirement too. One bit holds both ceilings.
+
+The Vulkan side agrees and names it: `tessellationShader=0`, with `geometryShader=1`,
+`shaderFloat64=1`, `multiDrawIndirect=1`, `fragmentStoresAndAtomics=1` and the rest of the 33
+features the probe reads all set. 197 device extensions, including `VK_EXT_transform_feedback`,
+`VK_KHR_draw_indirect_count` and `VK_KHR_maintenance2`.
+
+⚠ **AND THE BIT IS THIS PORT'S OWN DECISION, NOT GFX7's LIMIT.** `src/amd/vulkan/radv_physical_device.c`:
+
+    .tessellationShader = orbis_tessellation_available(),
+
+which defaults to false and returns true only for `ORBIS_NO_TESS=0`. The comment above it says no run
+has ever survived a pipeline that uses the stage on this silicon. So the ceiling is a documented
+retreat from a fault nobody has since gone back to.
+
+**What this makes worth doing**: find why the tessellation stage faults here. GFX7 has the hardware
+and radeonsi drives it, so the suspicion is RADV's configuration under this kernel - LDS layout, the
+HS/LS stage registers, or an initialisation Sony's own driver does differently. If that breaks, the
+port gains GL 4.6 and ES 3.2 together.
+
+⚠ **What is NOT worth doing is flipping the bit alone.** Advertising tessellation without fixing the
+stage buys a version number and a fault in any pipeline that uses it - worse than the honest 3.3.
+
+### A hypothesis this measurement killed
+
+`shaderFloat64` was the coordinator's suspicion, on the strength of `zink_screen.c:1258` referencing
+it. Wrong, and the source says so plainly: `zink_screen.c:877` sets `caps->doubles = true`
+unconditionally, and `st_extensions.c:1699` derives `ARB_gpu_shader_fp64` from that cap - so the
+Vulkan bit cannot gate it. `shaderFloat64` gates only the subgroup caps, which no GL 4.x rung
+requires. The probe reports `shaderFloat64=1` on this hardware anyway.
