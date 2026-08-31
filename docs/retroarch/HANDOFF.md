@@ -4572,3 +4572,29 @@ which is a real mark. No extra meter reads; the perturbation is unchanged.
   the next run should navigate between menu views that differ more sharply in draw count.
 - The quiet report is not zero either: **349 B/frame**, 296 of it in `eglSwap:enter..(next)`. Whatever
   switches on multiplies something that was always there.
+
+### 2026-08-31, tessellation landed - and the frontend was clamping cores to 3.3 on its own
+
+mesa-ps4 `0552ea5e2f6` maps Sony's tessellation factor ring, RADV reports tessellation, and
+`_mesa_compute_version` walks its extension ladder to the top: **the port is GL 4.6 / ES 3.2**. The
+44-case `dEQP-VK.tessellation` smoke passes 44/44 with the ring and died on the first tessellated
+draw without it.
+
+⚠ **Two places in this tree still said 3.3, and both would have hidden the gain.**
+
+- `gfx/drivers_context/orbis_gl_ctx.c` rung 0 rewrote any request above 3.3 down to 3.3 before it
+  reached `eglCreateContext`. That was right while 4.x was refused; with tessellation in, a core
+  asking for 4.1 would have silently got 3.3 and failed later, further from the cause. The clamp is
+  gone, `{4,6,1}` and `{4,5,1}` are rungs above `{3,3,1}`, and the comment now records why the old
+  ceiling existed rather than only that it did.
+- `Makefile.orbis`'s build banner printed `ceiling 3.3 core` on every build. A banner that states a
+  measured limit keeps stating it after the limit moves; dropped.
+
+⚠ **And the first package built after the fix did not contain it.** The Mesa archive was 36,209,554
+bytes at 22:07:28 and 36,217,692 at 22:12:10 - the build had already read the sources when the
+tessellation edits landed at 22:07:24. Same trap as the ccache one, from the other direction: the
+build succeeded, the banner was plausible, and the content was a few seconds stale. **Compare the
+archive size across a rebuild whenever a fix lands close to a build.**
+
+Shipped: `retroarchG-tess46-20260831.pkg` and `retroarchv-tess46-20260831.pkg`, both against the
+22:12:10 archive.
