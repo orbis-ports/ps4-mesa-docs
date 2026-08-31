@@ -4467,3 +4467,44 @@ when it had been producing plenty. glcore now reads `/data/retroarch-glcore-env.
 one.** A whole run's watchdog output was lost because the maintainer's log receiver had dropped, and
 the netlog and klog captures come from one script - losing it loses both. `ps4/orbis_watchdog.c` now
 writes every line to `/data/retroarch-watchdog.log` as well.
+
+### 2026-08-31, later - the allocator is exonerated too, and one constraint on how this can be tested
+
+**`musl mmap traffic since boot: 48 map(s), 0 FELL THROUGH to libkernel; 13 unmap(s), 0 FELL
+THROUGH.`** Zero, across a whole leaking run. And in isolation, on hardware: `malloc+free 96 KiB`
+**0 bytes over 2000 calls**, `mmap+munmap 64 KiB` **0 bytes over 500 calls**.
+
+That closes the last hypothesis that put the spending in code this port owns. The reasoning behind it
+was sound and is worth keeping: **bytes cannot leave libkernel's internal pool without a libkernel
+call**, Mesa's malloc reaches musl, and musl reaches `orbis-compat/src/orbis_mmap.cpp`, whose
+carve-outs serve what they can and fall through to the platform's `mmap` for the rest. The
+fall-through was never counted before. It is now, and it is zero.
+
+The ledger says the same thing from the other side, again: `present:exit..vkAcquire` **7,142 B/frame
+at 904 B/ms** and `vkAcquire..vkQueueSubmit2` **1,839 B/frame at 247 B/ms**, against 0-18 B/ms for
+every segment inside the winsys.
+
+⚠ **So the remaining route is instrumenting zink or the frontend.** Nothing else is left.
+
+### ⚠ A constraint on testing that invalidates the obvious next experiment
+
+The natural test - let the leak switch on in the menu, then return to the game and see whether
+B/frame falls with draws/frame (70 -> 19) - **cannot be run.** The maintainer reports that once the
+leak has switched on, the console is at the edge of needing a cold reboot; getting out without one
+takes practice and there is no returning to gameplay. Every run ends there.
+
+So per-draw and per-frame stay confounded, and any experiment that depends on *changing the workload
+after the switch-on* is unavailable. What is available: changing the workload **before** it, and
+comparing runs. A null core, or the menu with its shader chain disabled, would vary draws/frame in a
+run that can actually be completed.
+
+### Also settled
+
+`sceKernelInternalHeapPrintBacktraceWithModuleInfo` is **not usable here** - almost certainly a
+devkit-only stub. Fired twice with correct timing (14,013,568 bytes free at the first, 2,732,864 at
+the second, 11.28 MB moved between them) and wrote nothing to klog or anywhere else. Do not spend
+another round on it.
+
+And **"per second" is excluded from data already on disk**: in `gl12.log` presents per window fell
+154 -> 47 (~31 fps to ~9 fps) across fifteen consecutive reports while B/frame stayed at exactly
+9,280 throughout.
