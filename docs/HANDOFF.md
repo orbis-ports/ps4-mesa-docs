@@ -1,3 +1,182 @@
+# Handoff — tessellation works, and the port is GL 4.6 / ES 3.2, 2026-08-31
+
+**The single bit that capped this console at GL 3.3 is cleared.** `glcaps` had measured
+`GL_ARB_tessellation_shader` as the one missing extension of GL 4.0 with every rung above it already
+satisfied, and that bit was this port's own decision rather than GFX7's limit. The stage now works,
+the default is flipped, and the same flag carries ES 3.1 → 3.2 with it.
+
+## What the defect was, in one sentence
+
+Tessellation factors were **written** through a ring descriptor into a buffer of ours and **read**
+through `VGT_TF_MEMORY_BASE`, which on this console still held Sony's `0xff0000000` — an address
+nothing had mapped.
+
+That is why the two kinds of traffic disagreed and why the disagreement was invisible to every
+instrument tried before it. The writes travel in a descriptor (`radv_fill_shader_rings`, `desc[0]`)
+and followed our base exactly — correcting the offchip count from 72 to 256 buffers moved the write
+faults with the ring. The reads come from a register, and no value we wrote to that register ever
+took effect: written and read back in the same packet stream all three `VGT_TF_*` registers return
+`0x00000000`, while `SCRATCH_REG0` round trips through the same path.
+
+⚠ **And the address exists in no buffer, no descriptor and no packet of ours.** The register takes
+`va >> 8`, so the only number anywhere is `0x0ff00000`. An exact 64-bit scan over 580 MiB of mapped
+memory found `0xff0000000` zero times, which is why five hunts went past it.
+
+## The repair: put the ring where the register already points
+
+`ORBIS_TF_SONY_BASE` maps real memory at `0xff0000000` and moves **both** the factor ring's
+descriptor and its register there. The offchip ring stays ours — its address travels in `desc[4]` and
+has never been in doubt.
+
+**The point is that it does not need the register to work.** If our write lands it writes the value
+the register already holds; if it never lands, the hardware reads where it always read, and now there
+is something there. The question that four instruments could not settle — "does our write survive" —
+stops mattering.
+
+Two things made it available:
+
+* `sceGnmGetTheTessellationFactorRingBufferBaseAddress()`, called in our own process rather than
+  quoted from notes, answers `0xff0000000`
+* the decoy (`ORBIS_DECOY_VA`) had already proved that address can be backed with real memory,
+  because backing it turned a fatal fault into a completed frame
+
+⚠ **It is not a claim that the address is ours.** It is a claim that nothing else on this console
+uses it, and the evidence is that no retail title programs `VGT_SHADER_STAGES_EN.HS_EN` — 3057
+captured command streams, never once. If the mapping does not land at exactly that address the driver
+says so and falls back to our own ring, which is the old behaviour with the old fault.
+
+## Measured, and each line is a separate console run
+
+| run | configuration | result |
+|---|---|---|
+| 1 | `ORBIS_NO_TESS=1`, 44-case smoke | **44/44 NotSupported** — the switch is whole |
+| 2 | tessellation on, nothing else | **died** on `tesscoord.triangles_equal_spacing`, TC0 **read** at `0xff0010000` |
+| 3 | + `ORBIS_TF_SONY_BASE=1` | **44/44 Pass** |
+| 5 | the 535-case core group | **418 Pass, 117 Fail** |
+| 6 | + `ORBIS_TF_RING_PER_SE=1` | 72/192 — **the same 72 case names** |
+| 7 | + `ORBIS_HS_OFFCHIP_PER_SE=1` | 72/192 — **the same 72 case names** |
+| 9 | + the ring watermark | no overrun anywhere; offchip **never touched at all** |
+| — | OpenGothic, which tessellates | no fault, no artefacts, **45–60 fps** |
+
+Run 2 is the one that names the defect: the first genuinely tessellated draw this port has ever
+issued, faulting on a **read** at Sony's base plus an offset. The eight `limits.*` cases that passed
+just before it do not draw — `vktTessellationLimitsTests.cpp:73` compares
+`VkPhysicalDeviceLimits` and renders nothing.
+
+## The 117 failures are the geometry stage, and the correlation is total
+
+Every failing case was checked for a geometry shader by parsing the `.qpa`:
+
+    GS = no      418 pass      0 fail
+    GS = yes      54 pass    117 fail
+
+**Not one case without a geometry shader fails.** `invariance` splits exactly along that line —
+`tess_coord_component_range` and `one_minus_tess_coord_component` (no GS) are 36/36, while
+`outer_edge_index_independence` (GS) is 0/24. Those tests capture their tessellated primitives
+through a geometry shader into an SSBO; the tessellation is incidental to what they measure.
+
+⚠ **This was very nearly written up as a tessellation invariance defect.** The subgroup breakdown
+looked like a perfect story — every cross-draw comparison failing, every per-vertex property passing,
+isolines clean — and it survived two console runs of that reading. What killed it was opening one
+failing case's `.qpa` and finding `<GeometryShader>` as its first section. **The group name is not
+the workload.**
+
+So the remainder belongs to the open GS-ring defect this port already carries. Tessellation walked
+into it rather than causing it, and **OpenGothic ships no geometry shader at all** — only
+`shader/materials/main.tesc` and `.tese`.
+
+## Both ring-sizing questions are closed, with numbers
+
+Two per-shader-engine readings in `ac_gpu_info.c` had been tried before and judged by **where a write
+fault landed**, which is why each died on an arithmetic coincidence: `74 * 32768` hits the same byte
+as `factor_base + 0x10000`. There was no oracle then. Runs 6 and 7 gave them one, and both are dead —
+halving `VGT_TF_RING_SIZE` and halving `VGT_HS_OFFCHIP_PARAM` each returned the identical 72 case
+names.
+
+⚠ **Both arithmetics divide by `max_se = 2`, which this port marks UNCITED** while
+`num_shader_engines` says 1. "No change" therefore means "either the term is right or the divisor is
+wrong". `SQ_WAVE_HW_ID` would settle it and nothing has measured it yet.
+
+The watermark then answered the third term — the CU-topology sizing — directly. It poisons everything
+past `VGT_TF_RING_SIZE` inside Sony's 2 MiB mapping, where nothing else in the process can reach:
+
+    dEQP, 3320 submissions      BO 0 B disturbed; Sony's ring untouched past its size
+    OpenGothic, submission 7936 BO 8 358 144 B of 8 388 608 B; Sony's ring untouched
+
+`8358144` lies inside offchip buffer 255 (`255 * 32768 = 8355840`), so **all 256 buffers were used
+and none went past the ring** — exactly what `OFFCHIP_BUFFERING = 0x100` describes. `ac_gpu_info`
+sizes both rings correctly, now measured under a real title rather than on toy patches.
+
+⚠ **And dEQP could not have told us that.** Over 3320 submissions it wrote **zero bytes** of offchip,
+because RADV kept the TCS outputs in LDS. OpenGothic passes a real `Varyings` payload per vertex and
+uses 99.6% of the ring. A CTS group passing is not the same as a workload exercising the path.
+
+## What was charged to tessellation and was not tessellation
+
+The port's own record blamed the stage for a GPU fault, random artefacts and **a third of the frame
+time**. All three were the same defect: factors read from unmapped memory are garbage read as
+subdivision levels, and garbage can mean "split this patch 64 ways".
+
+With the repair, OpenGothic runs **45–60 fps — the same frame rate as with the stage switched off**.
+Tessellation is close to free here. The third of a frame was subdivision nobody asked for.
+
+## What shipped
+
+* `radv_physical_device.c` — `orbis_tessellation_available()` defaults **true**; `ORBIS_NO_TESS=1`
+  switches it back off and says that it also costs GL 4.6 and ES 3.2
+* `ac_orbis_drm.c` — `ORBIS_TF_SONY_BASE` defaults **on**; `=0` switches it off, `=<addr>[:<MiB>]`
+  moves it
+* `radv_queue.c`, `ac_cmdbuf_cp.c` — the descriptor and the register both take Sony's base, and
+  `ac_orbis_note_tf_base` records what the register will actually carry rather than what we allocated
+* `ac_orbis_drm.c` — `GRBM_GFX_INDEX` added to the register ladder, and `ORBIS_GRBM_BROADCAST`
+  broadcasts before the tessellation registers. **Unused by the repair and never needed**: it was the
+  other candidate, kept because the question it asks — why does no write to `VGT_TF_MEMORY_BASE` ever
+  take effect — is still open
+* `radv_queue.c` — the ring watermark extended to Sony's ring, and made to **report
+  unconditionally**
+
+⚠ **The watermark's first version could not say "nothing".** It printed only when the mark rose above
+the previous one, and the previous one starts at zero, so a run where the hardware disturbed nothing
+was indistinguishable from one where the instrument never fired and from one where it was never
+armed. Three states, one silence. It now prints every nth submission whatever the numbers are, with
+the submission count.
+
+## The test harness, in `VK-GL-CTS/targets/orbis/`
+
+`deqp-vk` is built for this console, so `dEQP-VK.tessellation.*` is the oracle; the GL equivalent
+(`KHR-GL46.tessellation_shader.*`) would need the `glcts` target built, which `ps4/build.sh` does not
+do.
+
+    cases-tess-smoke.txt        44    does the stage run at all
+    cases-tess-core.txt        535    everything except the tess_io matrix
+    cases-tess-invariance.txt  192    the group the hunt narrowed to
+    cases-tess-full.txt       1103    the whole group
+    make-tess-runs.sh                 generates each run's args and env
+    tess-select.sh <tag>              points the console at one run
+    README-tess.md                    how to read a run of them
+
+Each run writes its own `.qpa` and its own Mesa log, so no run can overwrite another's evidence. The
+loader reads `/data/deqp-args.txt` and `/data/deqp-env.txt` by name (`tcuMain.cpp:134,212`), so
+selecting a run means putting that run's pair there — which is all `tess-select.sh` does.
+
+⚠ **`amber/tessellation/` was missing from `/data/deqp-data` and aborted a run**, at
+`misc_draw.tess_factor_barrier_bug`. No earlier sweep had needed that directory.
+
+## Still open
+
+* **the GS ring mechanism** — now with 117 dEQP cases pointing at it, and a clean control: the same
+  tests without a geometry shader all pass
+* **why no write to `VGT_TF_MEMORY_BASE` ever takes effect.** The repair routes around it; nothing
+  explains it. `ORBIS_GRBM_BROADCAST` and the `GRBM_GFX_INDEX` ladder entry are there for whoever asks
+* **`max_se = 2` is still UNCITED**, and two dead experiments rest on it
+* **`glcaps.c` still describes tessellation as off by default.** It was left untouched on purpose —
+  there are 552 uncommitted lines in that file in the main checkout, and editing it here would have
+  handed the maintainer a conflict in the middle of their own work
+* **a stall warning at submission #1306** in the OpenGothic run — 6600 submissions before the first
+  tessellated draw, so it belongs to something else
+
+---
+
 # Handoff — RADV on the PS4, 2026-08-16 (afternoon)
 
 ## Where this is
@@ -622,8 +801,9 @@ the eight submissions it injects into the driver's own submit path.
 (8, best understood - the colour equivalents all pass), `vkCmdSetEvent2` (3), `dispatch.condition_size`
 (6, needs a 32-bit compare built without COND_EXEC, which is itself narrow).
 
-**B4. Tessellation (#21)** stays last: most expensive, no oracle, and its cheapest route starts by
-buying a game.
+~~**B4. Tessellation (#21)** stays last: most expensive, no oracle, and its cheapest route starts by
+buying a game.~~ **DONE 2026-08-31** - see the section at the top of this file. The oracle was
+`dEQP-VK.tessellation.*`, which `deqp-vk` already built for this console; no game had to be bought.
 
 ## ⚠ Traps that cost real time, in the order they will cost it again
 
@@ -662,7 +842,7 @@ exercised the single thing the change deliberately did not do.
 * **the GS ring mechanism** - both faults, neither understood
 * **multiview + geometry**, 63 tests, knowingly left broken
 * **multiview + multisample**, halts a run, never investigated
-* **#21** tessellation
+* ~~**#21** tessellation~~ - **CLOSED 2026-08-31**, and with it GL 4.6 and ES 3.2
 * **the arena still re-lets freed addresses immediately**, 16 warnings a run
 * **the retire drain runs on every unmap**; the repair must not be "protect less"
 * **`orbis-watchdog.txt` wrote one line** on a healthy multi-minute run
