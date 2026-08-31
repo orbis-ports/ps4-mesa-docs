@@ -4598,3 +4598,64 @@ archive size across a rebuild whenever a fix lands close to a build.**
 
 Shipped: `retroarchG-tess46-20260831.pkg` and `retroarchv-tess46-20260831.pkg`, both against the
 22:12:10 archive.
+
+### 2026-08-31, the tess46 run - the frontend is exonerated twice, and the window is down to one call gap
+
+`retroarchG-tess46-20260831.pkg`, one menu run, two reports.
+
+**The first report is exactly zero.** 120 sampled frames, 89 draws a frame, `every segment zero`.
+Not "small" - zero. Then the second, with the leak on:
+
+    7733 B/frame over 240 sampled frames of 1920 seen, 170 B/ms, 59 draw(s)/frame, 130 B/draw
+
+    present:exit..vkAcquire                          4065 B/frame  1019 B/ms   53%
+    video_frame..eglSwap   THE MENU'S GL DRAWING     2050 B/frame   604 B/ms   27%
+    vkAcquire..(next)                                 768 B/frame   251 B/ms   10%
+    eglSwap:enter..(next)                             668 B/frame   166 B/ms    9%
+    submit:exit..next mark                            105 B/frame    30 B/ms
+    flip_slot..copy                                    25 B/frame    10 B/ms
+    check_state..video_frame  INPUT+MENU+WIDGETS       17 B/frame     3 B/ms
+    runloop_iterate..check_state                        0 B/frame     0 B/ms
+    the four remaining winsys segments                 31 B/frame total
+
+⚠ **RetroArch's own code spends 17 bytes of 7,733 - two parts in a thousand.** That is the second
+independent run to say it, on a different build, after a different amount of menu navigation.
+
+⚠ **And draws fell while bytes rose: 89 draws/frame at 0 B/frame, then 59 draws/frame at 7,733.**
+Fewer draws, more bytes, in the same run. Per-draw is finished as a hypothesis - two runs now, and
+this one does not need the return-to-gameplay experiment the console cannot survive.
+
+### Where the 4,065 actually is, settled from source rather than from a label
+
+The chain print confirmed **`present:exit` is followed by `vkAcquire`**, so that segment's name is
+right. And `orbis_ledger_mark(ORBIS_LG_ACQUIRE)` sits at the **first statement** of
+`wsi_AcquireNextImage2KHR`, before `MESA_TRACE_FUNC()` and before any work.
+
+So the window is: **from the last statement of this port's `QueuePresentKHR` to the first statement
+of the next `AcquireNextImage2KHR`, and it contains neither.** What runs in it is
+`wsi_common_queue_present`'s epilogue and **zink's kopper swapchain code between present and
+acquire** - `src/gallium/drivers/zink/zink_kopper.c`. That is 53% of the leak in a gap between two
+calls, with nothing of ours inside it.
+
+The next 27% is `video_frame..eglSwap`, which is zink recording the menu's GL.
+
+### ⚠ The chain print was right about that and wrong about the rest, and the fix is in the tree
+
+It walks `orbis_lg_next[]`, which holds only each mark's **last** successor, and the report fires
+mid-frame - so the array is a mix of this frame and the previous one. The walk it printed omitted
+`eglSwap:enter` entirely while the byte column proved that mark fires every frame and carries 668
+bytes. A walk over last-seen pointers is not a transition set.
+
+Replaced with one: a bit per observed successor, printed as `[A] was followed by: B | C`. No extra
+meter reads.
+
+### And the GL version line does not survive a run
+
+`RARCH_LOG` goes to klog and the netlog, both of which need a listener, so the run that was supposed
+to confirm GL 4.6 could not be read for it afterwards - the same failure already recorded for the
+watchdog, in a new place. `orbis_watchdog_note()` is now exported from `ps4/orbis_watchdog.c`: one
+line to `/data/retroarch-watchdog.log` as well as `RARCH_ERR`, for **facts**, not events. Both GL
+context lines in `orbis_gl_ctx.c` use it.
+
+Shipped: `retroarchG-order2-20260831.pkg` and `retroarchv-tess46-20260831.pkg`, both against the
+22:31:14 driver.
