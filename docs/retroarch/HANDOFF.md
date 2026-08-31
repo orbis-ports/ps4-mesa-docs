@@ -4799,3 +4799,258 @@ Shipped as `retroarchG-census-20260831.pkg` against the 22:50:15 driver.
 **What the next run decides.** If the predicted bytes match the ledger's bytes, the leak is fully
 explained and the sites name the code to fix. If they do not match, the mechanism is real but
 something else is spending as well - and the gap is then a number, not a guess.
+
+### 2026-08-31 - the census found it, in the counter nobody was watching
+
+    report 1   368 mutex / 348 cond outstanding,  34267 rwlock,  ledger 2010 B/frame
+    report 2   368 mutex / 348 cond outstanding, 184057 rwlock,  ledger 9280 B/frame
+
+**Mutexes and conds are flat.** 368 and 348 outstanding, unchanged across both reports, 0 per frame -
+2424 created against 2056 destroyed, balanced churn. The two suspects the creation probe was written
+for are not doing this.
+
+⚠ **Rwlocks went 34,267 -> 184,057 across 960 frames: about 156 created per frame, none destroyed.**
+
+The predicted-bytes column read 0 in that report, and the ledger read 9,280, because the prediction
+only knew about the two primitives that were not moving. And the busiest-sites list added up to 165
+creations while 149,790 had happened - because `noteSite` was called for mutexes and conds and **not
+for rwlocks**. The instrument counted the right thing and attributed none of it.
+
+### ⚠ What is NOT concluded
+
+9,280 / 156 is 59.5, and a cond costs 64. That is one division away from a fifth retracted
+coefficient, and the divisor is a correlate: rwlocks per frame is derived from a cumulative total
+that includes every rwlock made before the frames in question. **The cost of an unbalanced rwlock has
+never been measured** - the first creation probe weighed the balanced pair (zero, like the others)
+and stopped.
+
+So two things ship, and neither divides:
+
+- `rwlock init, NO destroy` joins the startup probe, beside the mutex and cond variants that
+  measured 96 and 64. It runs before any leak and answers what one costs.
+- `noteSite` now records rwlock creations, and the sites list prints **creations since the last
+  report** rather than consuming its own table - the first version zeroed entries as it printed them,
+  which made the second report a delta by accident while the label claimed a total.
+
+The ledger line now carries the rwlock delta per frame beside the bytes, and says in words that the
+rwlock cost is not yet measured, so the prediction cannot be read as complete.
+
+Shipped as `retroarchG-rwlock-20260831.pkg` against the 22:59:06 driver.
+
+**What the next run decides.** `rwlock init, NO destroy` gives the per-object cost; the census gives
+rwlocks per frame; if their product matches the ledger, the leak is accounted for and the sites name
+the caller. The sites list is the half that matters either way - 156 rwlocks a frame is a specific
+thing some specific code is doing.
+
+## 2026-08-31 - THE LEAK IS FOUND, AND IT IS ONE MISSING LINE IN ZINK
+
+`src/gallium/drivers/zink/zink_resource.c`: `resource_object_create()` calls
+`u_rwlock_init(&obj->copy_lock)` and `zink_destroy_resource_object()` destroys `surface_mtx` and then
+`FREE(obj)` - **without ever destroying `copy_lock`**. It is the only `u_rwlock_init` in the file and
+zink's only `u_rwlock_destroy` is in `zink_program.c`, on a different lock.
+
+On glibc this is invisible: the rwlock's storage lives inside `obj` and goes away with the FREE.
+On this console it is not free.
+
+### The three measurements that name it, none of them a division
+
+**1. What an unbalanced primitive costs, measured in isolation at startup:**
+
+    mutex  init+destroy       0 bytes over 2000 call(s)
+    cond   init+destroy       0 bytes over 2000 call(s)
+    rwlock init+destroy       0 bytes over 2000 call(s)
+    thread create+join        0 bytes over   50 call(s)
+    mutex  init, NO destroy  24576 bytes over 256 = 96 bytes each
+    cond   init, NO destroy  16384 bytes over 256 = 64 bytes each
+    rwlock init, NO destroy  16384 bytes over 256 = 64 bytes each
+
+**2. What the process actually holds** (`--wrap` census over the whole link):
+
+    outstanding    367 mutex /   348 cond /   5743 rwlock   ledger   349 B/frame
+    outstanding    367 mutex /   348 cond / 146268 rwlock   ledger  8701 B/frame
+    per frame seen   0 mutex /     0 cond /    146 rwlock
+
+Mutexes and conds are **flat** - 2387 created against 2020 destroyed, balanced churn, zero per frame.
+Rwlocks are created 146 times a frame and destroyed never.
+
+**3. Which code** - one site, 140,525 of 140,525 creations in that window:
+
+    0x000000000116b7b2 -> load base 0x400000 -> 0xd6b7b2 -> resource_object_create, zink_resource.c
+
+The base was not assumed: the six probe sites in `orbis_mem.cpp` land inside
+`_ZN5orbis19internalMemoryProbeEv` (0x15e7cf0, span 0x1390) at exactly that slide, all six.
+
+**146 x 64 = 9,344 against a ledger reading 8,701**, and the ledger is known to under-count - it
+books nothing for the gap between one sampled frame's last mark and the next sampled frame's first,
+by design. Predicted above measured is the expected direction.
+
+### The fix
+
+    u_rwlock_destroy(&obj->copy_lock);
+
+in `zink_destroy_resource_object`, beside the `simple_mtx_destroy` that was already there.
+
+⚠ **And `Makefile.orbis` would have hidden it.** The ELF depended on `$(RADV_ARCHIVE)` only, and zink
+lives in `$(GALLIUM_ARCHIVE)` - so a zink-only fix would have packaged the previous driver and read
+as "the fix did not work", which is exactly the four-round failure already recorded for RADV in
+`149d4df1ef`. Both archives are dependencies now.
+
+Shipped as `retroarchG-rwfix-20260831.pkg` against the 23:08:09 driver.
+
+**What the next run decides.** The census stays in, so the run reports it: rwlocks outstanding should
+stop climbing and the per-frame delta should read 0, exactly as mutexes and conds already do. If the
+ledger then still shows bytes a frame, what remains is a second consumer and its size is known before
+anyone goes looking.
+
+### Worth carrying upstream
+
+This is not PS4-specific code. `zink_destroy_resource_object` leaks a `pthread_rwlock_t` on every
+platform; it is only measurable where `pthread_rwlock_init` reserves a system resource that
+`pthread_rwlock_destroy` returns. Worth a Mesa merge request on its own merits.
+
+### 2026-09-01 - the fix is confirmed in gameplay, and the instruments are turned down
+
+**Confirmed without waiting for a crash.** Three consecutive census reports:
+
+    outstanding 367 mutex / 348 cond / 900 rwlock   created 363410, destroyed 362510
+    outstanding 367 mutex / 348 cond / 900 rwlock   created 539741, destroyed 538841
+    outstanding 367 mutex / 348 cond / 900 rwlock   created 715872, destroyed 714972
+    per frame seen: 0 mutex, 0 cond, 0 rwlock       (was 146 rwlock)
+
+352,462 rwlocks created and exactly 352,462 destroyed across those reports, outstanding pinned at
+900. The same call site is still doing the work - the address moved 0x116b7b2 -> 0x116b7d2 because
+the file grew by the fix - and every one of them now comes back.
+
+The pool **oscillates** instead of draining: 13,898,944 / 13,889,664 / 13,908,992 / 13,900,352 /
+13,892,544 / 13,901,568, about 55 KB below startup, moving both ways. The ledger reads **negative**
+(-8,806 and -10,173 B/frame, 4.4 MB recovered over 4,800 frames) - not a leak in reverse, but the
+backlog of pre-fix resources being freed with their rwlocks finally released.
+
+Maintainer confirms it survives gameplay, not just the menu.
+
+### ⚠ And then the instrument became the problem
+
+Visible stutter in gameplay with everything on. The ledger runs **on the frame path**: it reads
+libkernel's internal-memory meter about 110 times a second and writes two long lines every 120
+sampled frames, and `MESA_LOG_LEVEL=info` puts every Mesa info message through a file write.
+
+- **The ledger is opt-in now** (`ORBIS_LEDGER=1`), where it used to be opt-out. `ORBIS_NO_LEDGER` is
+  still honoured so an env file written under the old rule keeps meaning what it said. An instrument
+  on by default is a tax on every future run for a question already answered.
+- **The watchdog's pool line backs off**: five seconds while more than 1 MB below startup, sixty
+  otherwise. It existed to catch a monotone descent and it caught one; with the descent fixed, a line
+  every five seconds costs a synchronous 8-15 ms write to say the pool moved 9 KB.
+- Console env file set to `MESA_LOG_LEVEL=error` and `ORBIS_NO_LEDGER=1` for immediate relief without
+  a reinstall - env is read at startup, so a restart is enough.
+
+The `--wrap` census stays: it is six counters and a short hash probe, it costs nothing measurable,
+and it is what turns "the leak is back" into a number on the next run rather than another hunt.
+
+Shipped as `retroarchG-quiet-20260901.pkg` against the 23:17:11 driver.
+
+### 2026-09-01 - a stutter that is NOT the instrumentation, and a wrong diagnosis on the way there
+
+⚠ **Correction.** The maintainer reported stutter, I assumed the frame ledger, turned it off, and the
+stutter stayed. It then turned out to happen **from RetroArch's startup, before any core is loaded,
+and to predate the tessellation work entirely.** None of today's instrumentation is responsible. The
+ledger and the log level were turned down anyway - both were real costs on the frame path and the
+question they answered is closed - but they were not this.
+
+Reported rhythm: **regular, every few seconds**, independent of input.
+
+### What that points at, and the test that costs nothing
+
+`ps4/orbis_watchdog.c` runs a sampling thread every 500 ms and every line it writes goes through
+`wd_to_file`, a **synchronous 8-15 ms write to /data**. In the menu it has a standing complaint: the
+run loop moves and `retro_run` is never entered, so "the core is not being called" fires on a timer
+from startup for as long as the menu is open. The pool line was on a 5-second timer too until today.
+
+That is a periodic write on a timer, from startup, with no core loaded - which is the description.
+It has never been tested, because testing it used to cost a build.
+
+**`ORBIS_WD=0` now returns from `orbis_watchdog_thread` before it starts.** Anything else, or an
+unset variable, leaves the watchdog exactly as it was. Shipped as `retroarchG-wdoff-20260901.pkg`
+and the console's env file carries the knob.
+
+⚠ Note the thread is not the frame thread, so if this *is* the cause, the mechanism is a synchronous
+/data write blocking more than its own thread - which would be worth knowing on its own.
+
+### A real bug found while chasing the wrong thing
+
+`ps4/orbis_exec_mem.c`: melonDS promotes two ranges of 131,072 KiB whose bases are 224 KiB apart -
+`0x800e14000` and `0x800e4c000`. Neither contains the other, so the containment test missed both
+ways and the two alternated for the whole session: mprotect, stub, log, mprotect, stub, log.
+
+**The stub is six bytes of x86 memcpy'd into the buffer**, so this was writing over melonDS's
+generated code during gameplay - exactly what the comment above the table says must never happen.
+
+Fixed: overlap instead of containment, the union is stored, the table is 16 slots instead of 4, and
+a range that touches anything already proven takes that verdict instead of running the stub. The
+routine success lines are now once per module (`ORBIS_EXEC_MEM_VERBOSE=1` restores them); failures
+stay loud.
+
+⚠ **That file is in the CORE-SUPPORT archive, not the frontend** - so the fix reaches nothing until
+the cores are rebuilt. The frontend package built after the change is byte-identical in that respect.
+melonDS needs a rebuild for it.
+
+## 2026-09-01 - the stutter was an env file, and it was never the instrumentation
+
+A 1.47-1.53 s freeze every 768 run-loop iterations, in the menu, from startup, with no core loaded.
+Found in four steps, two of which were wrong:
+
+1. Assumed the frame ledger. Turned it off. **Unchanged.**
+2. Assumed the watchdog's synchronous 8-15 ms writes. Added `ORBIS_WD=0` and turned the thread off
+   outright. **Unchanged.**
+3. Lowered `ORBIS_WD_STALL` to 250 ms - and the sampling with it, because at 500 ms a half-second
+   hitch can begin and end between two samples - and had Mesa's ledger marks publish the last point
+   reached. The stall named itself: phase `video:driver_frame`, graphics mark
+   **`vkQueueSubmit2..winsys submit`**, sequence frozen, **exactly 768 iterations apart every time.**
+4. ⚠ **A period that exact is a counter, not a clock.** Turned the Mesa log back to `info` - free,
+   no rebuild - and the log said it outright:
+
+       radv/orbis: tess watermark @ submission 256 - BO 0 B of 8649728 disturbed
+       radv/orbis: tess watermark @ submission 512 - ...
+       radv/orbis: tess watermark @ submission 768 - ...
+
+**`ORBIS_TESS_RING_WATERMARK=256` was left in `/data/tempest-env.txt` after an OpenGothic run, and
+`platform_orbis.c` reads that file FIRST on every RetroArch launch.** Every 256th submission, RADV
+walked 8,649,728 bytes backwards one byte at a time on the submit path.
+
+⚠ **The shared env file makes one title's instrument every title's cost.** The file's own comment
+calls it "one place to change them for every title" - true in both directions, and the second
+direction had never been counted.
+
+⚠ **And the maintainer's "it did not do this at the start of today" was correct and I read it too
+literally** - as excluding tessellation. The watermark was in the working tree hours before the
+tessellation commit, so builds from before the commit already carried it.
+
+### Fixed in two places
+
+- The knob is commented out on the console, with a note saying why.
+- `orbis_tess_watermark_scan()` now compares 4 KiB blocks with `memcmp` and byte-walks only the one
+  block that differs. Same answer, ~two orders of magnitude cheaper - the instrument was unusable for
+  the OpenGothic run it exists for.
+
+### One package again
+
+RTRG00001 / RetroArchG existed for one day, while it was unknown whether the desktop context worked.
+It does - GL 4.6 core, GLSL 4.60, and the cores see it - so `HAVE_OPENGL_CORE` is the default, there
+is one title (RTRV00001), one user directory (`/data/retroarch/`), one env file and one package name.
+`HAVE_OPENGLES=1` still builds the ES flavour; it just is not a second application.
+
+⚠ **`/data/retroarch-glcore/` is now orphaned** and holds one day of melonDS saves and three cores
+newer than the ones in `/data/retroarch/cores/`. Nothing has been moved: both directories hold a
+melonDS save for the same game and choosing between them is not this port's decision.
+
+### Commits
+
+    mesa-ps4   zink: destroy the resource object's rwlock
+               orbis: scan the tess watermark by block, not by byte
+               orbis: remove the internal-memory instrumentation
+    RetroArch  (ps4) Promote an overlapping exec range without re-running the stub
+               (ps4) Give the watchdog a kill switch and a stall threshold
+               (ps4) Let a core have the GL version it asks for
+               (ps4) One package again, on desktop GL
+
+⚠ `git diff` in this environment is wrapped by rtk, which reformats it - piping it into `git apply`
+yields "No valid patches in input". Use `/usr/bin/git` for anything machine-read.
