@@ -4752,3 +4752,50 @@ Shipped as `retroarchG-create-20260831.pkg`. `ORBIS_INTERNAL_MEM_PROBE=1` is alr
 likely explanation; it is not distinguishable from a genuine stall in the log, which is itself a
 defect in the watchdog. Alongside it, audio ran at **100% underrun** - `1875 underruns in 1875
 grains, rc=256`, repeating - which is also what a paused core would produce.
+
+### 2026-08-31 - THE MECHANISM IS NAMED: an unbalanced pthread primitive costs this pool
+
+The creation probes, on hardware, at startup, before any leak:
+
+    mutex init+destroy          0 bytes over 2000 call(s) = 0 bytes each
+    cond  init+destroy          0 bytes over 2000 call(s) = 0 bytes each
+    rwlock init+destroy         0 bytes over 2000 call(s) = 0 bytes each
+    thread create+join          0 bytes over   50 call(s) = 0 bytes each
+    mutex init, NO destroy  24576 bytes over  256 call(s) = 96 bytes each
+    cond  init, NO destroy  16384 bytes over  256 call(s) = 64 bytes each
+
+**A balanced pair costs nothing. An unbalanced one costs 96 bytes for a mutex and 64 for a cond.**
+Every other candidate ever weighed here reads zero: locks, unlocks, an expired timed wait, both
+clocks, `sceKernelUsleep`, `sceVideoOutGetFlipStatus`, malloc, mmap. This is the mechanism, and it
+was found by a probe that runs at startup - no return to gameplay, no cold reboot.
+
+⚠ **It also explains the constant that has been sitting in every log since the beginning.** 9,280
+bytes leave this pool exactly once at startup in every run ever captured, including the Vulkan run
+that then stays flat. One batch of pthread objects created at init and held is what that looks like;
+glcore repeating it every frame is what the leak looks like.
+
+### ⚠ And the next step is NOT arithmetic
+
+9280 / 64 is exactly 145, and `96a + 64b = 9280` has many solutions. Four coefficients in this
+investigation were each a window total divided by a correlated aggregate, and all four were
+retracted. **So the instrument counts objects rather than dividing bytes.**
+
+`orbis-compat/src/orbis_pthread_census.cpp` interposes the six calls with `-Wl,--wrap` at the final
+link, which is the one place that sees Mesa's archive and the frontend's objects together - exactly
+the region the frame ledger points at - and does not see libkernel's own internal calls. It reports:
+
+- mutexes, conds and rwlocks **outstanding**, with creations and destructions separately;
+- the delta since the last report, **per frame seen**, and what that predicts in bytes at the
+  measured 96 and 64, printed **beside the ledger's own bytes-a-frame** so the two can be compared
+  directly rather than reconciled later;
+- the **busiest creation sites** as return addresses, because a count without a caller is another
+  round of guessing.
+
+No lock inside the census: a census of mutex creation that took a mutex would measure itself, and a
+lost count under a race cannot change whether the answer is 145 or 0.
+
+Shipped as `retroarchG-census-20260831.pkg` against the 22:50:15 driver.
+
+**What the next run decides.** If the predicted bytes match the ledger's bytes, the leak is fully
+explained and the sites name the code to fix. If they do not match, the mechanism is real but
+something else is spending as well - and the gap is then a number, not a guess.
