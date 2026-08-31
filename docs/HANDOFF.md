@@ -162,6 +162,28 @@ selecting a run means putting that run's pair there — which is all `tess-selec
 ⚠ **`amber/tessellation/` was missing from `/data/deqp-data` and aborted a run**, at
 `misc_draw.tess_factor_barrier_bug`. No earlier sweep had needed that directory.
 
+## The default is the shipped one, and proving that took a second run
+
+⚠ **The first attempt measured the harness.** Run 10 shipped an env file with no driver knob in it at
+all - the only thing that tests a default - and came back **44/44 NotSupported**. The driver was
+fine; `tcuMain.cpp` defaulted `ORBIS_NO_TESS=1` in its own environment table, and
+`targets/orbis/deqp-env.txt` carried the line as well. Both were added when the stage faulted, and
+both silently overrode the flag the run existed to test.
+
+**A harness that injects the setting it is testing cannot test it.** The only reason this was not
+written up as "the driver default did not take" is that the driver logs which value it saw:
+
+    MESA: warning: orbis: ORBIS_NO_TESS=1 - tessellation is NOT advertised
+
+With both removed, the same 44 cases pass with nothing set anywhere:
+
+    44/44 Pass, 0 NotSupported
+    TF_SONY_BASE mapping 0xff0000000 with no env var asking for it
+    no "NOT advertised" warning
+
+So the shipped configuration tessellates, and `ORBIS_NO_TESS` / `ORBIS_TF_SONY_BASE` are switches
+rather than requirements.
+
 ## Still open
 
 * **the GS ring mechanism** — now with 117 dEQP cases pointing at it, and a clean control: the same
