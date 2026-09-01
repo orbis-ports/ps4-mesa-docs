@@ -5054,3 +5054,49 @@ melonDS save for the same game and choosing between them is not this port's deci
 
 ⚠ `git diff` in this environment is wrapped by rtk, which reformats it - piping it into `git apply`
 yields "No valid patches in input". Use `/usr/bin/git` for anything machine-read.
+
+### 2026-09-01, closing - one package, tidy history, and a transfer hazard worth knowing
+
+**Confirmed working on hardware.** `retroarch.pkg`, RTRV00001 / RetroArchV, desktop GL by default,
+built clean from `ef0dbdbc74`.
+
+**History rewritten, 22 unpushed commits -> 16.** The two-eboot detour is gone from history rather
+than undone by it: `43ecfc9f96` (a second eboot) and the later "one package again" collapsed into a
+single `(ps4) Desktop OpenGL over zink` that adds desktop GL to the *only* package. RTRG00001,
+`/data/retroarch-glcore/` and the per-flavour env file never exist at any commit. Four watchdog
+commits became one; the gallium link dependency folded into the RADV one, being the same defect found
+twice; the RetroArch-side leak instrumentation went the way of Mesa's.
+
+⚠ Two mistakes during the rewrite, both caught by building afterwards: stripping the heap-dump block
+took a closing brace with it, and a `reset --hard` dropped the relink commit. **A rewritten history
+that has not been compiled is a guess.**
+
+### The console's user directory
+
+Cores migrated to `/data/retroarch/cores/` and verified byte-for-byte; the `.info` files were already
+there and identical. `/data/retroarch-glcore/`, its env file and its 7 MB Mesa log are deleted, as is
+`/data/retroarch-heap-backtrace` - the arming gate for a dump the code no longer contains.
+
+⚠ **One file survives: `/data/retroarch-glcore/system/melonDS DS/wfcsettings.bin`, 2304 B.** The FTP
+server answers `550 File unavailable` for it, by absolute path and by relative name from inside its
+directory, so it is not the space in the name. Most likely still held by the process that wrote it at
+00:52. Retry after a console restart.
+
+### ⚠ FTP DOWNLOADS FROM THIS CONSOLE CORRUPT LARGE BINARIES
+
+Fetching the three cores back to migrate them produced files LARGER than the source: melonDS
+9,720,696 against 6,653,040, scummvm 48,383,864 against 42,120,320 - different ratios, so
+content-dependent. Not CRLF expansion: undoing that did not recover the size, and the file carried a
+valid ELF header. The console's own LIST sizes matched the local build artifacts exactly, so **the
+listing is right and the download is wrong.**
+
+Uploads are fine - every package this session matched byte-for-byte in both directions. So: **push to
+the console, never pull a binary back from it.** Text logs read correctly all day, but a core fetched
+from the console and sent anywhere else would be silently damaged.
+
+### Still open
+
+- Nothing is pushed: 16 commits on RetroArch `ps4-support`, 14 on mesa-ps4 `orbis`, plus this repo.
+- `backup-before-tidy` still points at the pre-rewrite state; delete it once the new history is trusted.
+- The zink `u_rwlock_destroy` fix is not PS4-specific and deserves a Mesa merge request.
+- The release: 8 cores plus swanstation build, blocked on the per-core timeout and a clean sweep.
