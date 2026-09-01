@@ -5100,3 +5100,147 @@ from the console and sent anywhere else would be silently damaged.
 - `backup-before-tidy` still points at the pre-rewrite state; delete it once the new history is trusted.
 - The zink `u_rwlock_destroy` fix is not PS4-specific and deserves a Mesa merge request.
 - The release: 8 cores plus swanstation build, blocked on the per-core timeout and a clean sweep.
+
+### 2026-09-01 - the release chain has an ordering hazard built into it
+
+Pushing the four repositories in the obvious order still failed once, and the failure is structural
+rather than a one-off:
+
+    08:35:55  orbis-mesa release starts (tag push)
+    08:37:50  CI PS4 frontend starts (branch push)
+    08:39:07  frontend: gh release download orbis-mesa-16b12ca41c32 -> "release not found"
+    08:42:27  orbis-mesa release completes, asset published
+
+⚠ **`frontend.yml` fires on a branch push and the Mesa bundle is produced by a TAG push, so the two
+are concurrent whenever both go out together.** The frontend reaches for an asset that does not exist
+yet, and the run dies in the toolchain action's very first step. Nothing is wrong with either commit.
+
+Fixed by re-running the frontend after the release landed. Two better options for next time:
+
+- push the Mesa tag, WAIT for the release to complete, then push RetroArch; or
+- give the `orbis-toolchain` action a short retry around `gh release download`, since "release not
+  found" is the one error there that fixes itself. Everything else it can hit is genuine.
+
+⚠ Also worth knowing before the next release: **the correct push order is longer than "Mesa first".**
+The Mesa release job builds against `ORBIS_COMPAT_DIR` and records that sha in its manifest, and
+RetroArch's workflows pin an `orbis-compat-ref` of their own. orbis-compat was 8 commits ahead of its
+remote at a sha nothing had pinned, so the real order is:
+
+    orbis-compat -> mesa-ps4 branch -> mesa-ps4 tag (cuts the release) -> RetroArch -> docs
+
+and RetroArch's `cores.yml` / `frontend.yml` both carry `mesa-release` and `orbis-compat-ref`
+defaults - four pins between them, eight edits - that have to move with it or CI silently builds
+against the previous Mesa.
+
+### ⚠ Flipping a Makefile default reaches outside the Makefile
+
+`HAVE_OPENGL_CORE ?= 1` was verified locally against both flavours, the core sweep and the CI pins -
+and CI still stopped dead:
+
+    Makefile.orbis:243: *** HAVE_OPENGLES and HAVE_OPENGL_CORE are mutually exclusive
+
+`frontend.yml` invoked `make` with `HAVE_OPENGLES=1` written out explicitly. The default moved under
+a caller that names the old value, and **no local build could have caught it, because locally that
+flag is never passed.** The fix is to stop naming the flavour in CI at all: the job now builds
+whatever `Makefile.orbis` says the package IS, rather than holding a second opinion about it.
+
+⚠ **The guard is why this was cheap.** Had the two flags merely been last-one-wins, CI would have
+built and published an ES binary under the desktop release's name, and the mismatch would have
+surfaced on somebody's console instead of in a build log. A hard `$(error)` on a pair that must never
+both be set turned a silent wrong package into a loud stopped build.
+
+`cores.yml` needed no change: it passes no `--gl` and an explicit `--out "$WORK/out"`, which is the
+desktop set under the new default.
+
+### Watch when cores.yml next runs
+
+`scummvm`, `flycast` and `swanstation` are absent from the published index (which dates from
+2026-08-29, before they were confirmed), and `cores.yml` hardcodes `--core-timeout 1500`. Locally
+scummvm needed the cap raised to 5400 at `-j 4`. Whether 1500 is enough on a runner is untested; if
+it is not, the core is reported `TIMEOUT` rather than vanishing, so the run will say so.
+
+## 2026-09-01 - the release order, learned by getting it wrong three times
+
+Each step reads an artefact the previous one produces, and every one of them looks independent until
+it fails. The order is:
+
+    1. orbis-compat            push the branch
+    2. mesa-ps4                push the branch
+    3. mesa-ps4                push the tag, WAIT for the release to finish
+    4. RetroArch               repin mesa-release + orbis-compat-ref, push the branch
+    5. RetroArch               push retroarch-ps4-v*, WAIT for the release to be cut
+    6. cores.yml               dispatch LAST
+
+**Why 3 must complete before 4.** `frontend.yml` fires on a branch push and the Mesa bundle comes
+from a TAG push, so both run at once if both go out together. The frontend reaches for
+`orbis-mesa-*.tar.gz` and dies on `release not found`. Nothing is wrong with either commit.
+
+**Why 4 needs the repin.** The Mesa release job builds against `ORBIS_COMPAT_DIR` and records that
+sha; `cores.yml` and `frontend.yml` each carry `mesa-release` and `orbis-compat-ref` defaults - four
+pins, eight edits. Miss them and CI silently builds against the previous Mesa while the local package
+is built against the new one: two different programs under one name.
+
+**Why 5 must complete before 6.** ⚠ The core page embeds the FRONTEND's version and download URL,
+resolved at generation time:
+
+    tag="$(gh release list ... startswith("retroarch-ps4-v"))][0].tagName')"
+    version="${tag#retroarch-ps4-}"
+
+Publishing cores before the frontend release exists produces a correct index and a page offering the
+PREVIOUS package. It is not a build failure and nothing reports it - the maintainer noticed the page
+still said v0.1.6. The repair is cheap and does not need another sweep: re-run the `publish` job
+alone (`gh run rerun <run> --job <id>`), which still has the shard artefacts.
+
+### And the one that no ordering fixes
+
+⚠ **`HAVE_OPENGL_CORE ?= 1` was verified against both local flavours, the sweep and the CI pins, and
+CI still stopped dead** - `frontend.yml` called `make` with `HAVE_OPENGLES=1` spelled out. A default
+moved under a caller that names the old value, and no local build could catch it because locally that
+flag is never passed. When a default changes, grep the CALLERS, not just the builds.
+
+## 2026-09-01 - v0.1.7 is out, and where everything stands
+
+**Published and verified live:**
+
+    retroarch-ps4-v0.1.7        RetroArchV-PS4-v0.1.7.pkg, 63,766,528 B
+    orbis-mesa-16b12ca41c32     16,422,480 B, one asset
+    cores.prx0.com              113 cores, index + page, both pointing at v0.1.7
+
+⚠ The page is served at `cores.prx0.com/index.html`; bare `/` returns Cloudflare's 404. Pre-existing,
+but it looks like the site is down.
+
+**What shipped:** GL 4.6 / GLSL 4.60 through zink; the 9,280 B/frame libkernel pool leak fixed in
+zink's `resource_object_create`; one package again on desktop GL; melonDS's JIT no longer overwritten
+by the execute probe; Nintendo DS in the Core Downloader for the first time.
+
+**All four repositories are pushed.** RetroArch `ps4-support`, mesa-ps4 `orbis` (+ tag), orbis-compat
+`master`, ps4-mesa-docs `main`. Every push was a fast-forward - the rewritten RetroArch history never
+reached the remote, so no force was needed.
+
+### Left open
+
+- `backup-before-tidy` in RetroArch still points at the pre-rewrite history. The new history has been
+  through a full CI run and a release; it can go whenever someone is confident.
+- `/data/retroarch-glcore/system/melonDS DS/wfcsettings.bin`, 2304 B, is the last of the old user
+  directory. The console's FTP answers `550 File unavailable` for it by any path - most likely still
+  held by the process that wrote it. Retry after a restart.
+- `parallel_n64` does not link (`get_addr_ht`). It is now REPORTED rather than invisible, which is
+  new; before today the `--all` filter dropped it silently.
+- The zink `u_rwlock_destroy` fix is not PS4-specific and deserves a Mesa merge request.
+- `3dengine`, `ffmpeg` and `ppsspp` are `GENERIC_GL` with no flags in `core_make_flags()`, so they
+  stay out of the sweep by the same rule the sharder uses. Untried, not broken.
+
+### ⚠ The lesson this session kept re-teaching, in four costumes
+
+**A tool answering about a PAST state looks exactly like one answering about NOW.**
+
+    the stale liborbis-retro-common.a   cached unless absent, so every local sweep since the dylib.c
+                                        change linked the PREVIOUS dylib.o - melonDS passed locally
+                                        and failed in CI, and CI was right
+    ccache's frozen __DATE__/__TIME__   the log confirmed a driver that was not running
+    the un-relinked frontend            `make pkg` succeeded and packaged the previous Mesa
+    a reused GitHub job id              every rerun mints a new id; polling the old one reported a
+                                        stale verdict as a fresh failure
+
+In all four the fix was to force a fresh measurement, not to read the same answer again. When a
+result is surprising, ask first whether the instrument could be answering about yesterday.
