@@ -5244,3 +5244,81 @@ reached the remote, so no force was needed.
 
 In all four the fix was to force a fresh measurement, not to read the same answer again. When a
 result is surprising, ask first whether the instrument could be answering about yesterday.
+
+## 2026-09-14 - Trident (3DS) plays A Link Between Worlds, and five things were in the way
+
+**Result on hardware:** The Legend of Zelda: A Link Between Worlds (a decrypted CIA, its main NCCH cut
+out as a `.cxi`, because Trident's `valid_extensions` is `3ds|3dsx|elf|axf|cci|cxi|app`) boots, renders
+correct 3D, and runs at 22-28 fps in the field, ~15 fps in the animated title scene, with stutter while
+new shaders compile. Before the day it aborted at boot.
+
+Trident now comes from a fork, like Beetle PSX: `orbis-ports/3dsTrident` -> `orbis-ports/Panda3DS` ->
+`orbis-ports/{dynarmic,fmt,SDL}`, each on `ps4-support`, each `.gitmodules` pointing at the next fork.
+`ps4/core-recipe-extra` overrides the recipe line; `ps4/core-patches/trident` is gone. Local clone:
+`~/src-ps4/3dsTrident`.
+
+### 1. `stat()` in orbis-compat returned SCE codes (orbis-compat `022350b`)
+
+    libc++abi: terminating with uncaught exception of type filesystem_error:
+      in create_directories: File exists [.../Emulator Files/TLOZALBWEU/../SharedFiles/NAND]
+
+`sceKernelStat` fails with `0x8002_0000 | errno`, not `-1`. The wrapper passed that through, libc++'s
+`posix_stat` tests `== -1`, took a MISSING path for success and read an unfilled struct as "exists, not
+a directory". ⚠ The `..` in the path was a red herring - a patch removing it changed the message and
+nothing else. Any C++ core using `std::filesystem` was exposed.
+
+Then `remove_all: I/O error` on an empty `SaveData`: `unlink`/`rename` set EIO for every failure, musl's
+`remove()` only tries `rmdir` on EISDIR, and this kernel answers EPERM for `unlink(dir)` anyway.
+`ab4c066` decodes the errno and adds a `remove()` that asks `stat` first.
+
+### 2. The idle thread spun ~190k SVCs a frame (Panda3DS `7aa98ab4`)
+
+Counted, not timed (timing each SVC made the game 7x slower and hid the answer): 190k `SleepThread(0)`
+per frame from `0x3FC0000C`, Panda3DS's own injected idle thread. `sleepThread(0)` does skip the clock to
+the next event, but the JIT keeps running on the `ticksLeft` it started with, so the event is never
+serviced and every later iteration finds nothing to skip - `skip 6 / noskip 195363` a frame. Zeroing
+`ticksLeft` after the skip (dynarmic reloads `GetTicksRemaining` after every SVC) took it to 140 SVCs a
+frame and the title screen from 77-95 ms to 42 ms. Not PS4-specific; worth upstreaming.
+
+### 3. Lit objects were clipped away by an uninitialised uniform (Panda3DS `618d9c5e`)
+
+2D and unlit geometry drew; characters and objects did not - with GPU or CPU vertex shading, and even
+with the fragment shader forced to magenta, so no fragment was ever produced. Shadergen's vertex shader
+writes `gl_ClipDistance[1] = dot(clipCoords, a_coords)`, nothing enables `GL_CLIP_DISTANCE1`, and
+`PICA::FragmentUniforms uniforms;` leaves `clipCoords` as stack garbage when the game has clipping off.
+Ordinary GL drivers ignore disabled clip distances. ⚠ **Zink does not**: there is no `clip_plane_enable`
+handling under `zink/`, and `st_atom_shader.c` lowers disabled distances only for compat/GLES1
+(`st_user_clip_planes_enabled`). The core fix sets `(0,0,0,1)`; **the Mesa bug remains for every other
+core that writes `gl_ClipDistance` without enabling it** - open item.
+
+### 4. The x64 shader JIT had no executable memory (Panda3DS `99f69f94`)
+
+`Xbyak::Error: can't alloc` whenever a draw needed the CPU vertex path with the JIT on (ubershaders off,
+or GPU shaders off). Xbyak's default allocator is `malloc` + `mprotect(RWX)`. Emitters (~388 KiB each,
+one per shader) now take equal blocks from a 256-block `orbis_exec_mem_alloc` arena; a full arena clears
+the shader cache and retries instead of aborting.
+
+### 5. What the options do here
+
+`accelerateShaders` is only used when the ubershader is NOT (`prepareForDraw`), so ubershader-on means
+every vertex on the CPU (136 draws a frame, 21 ms). Best measured: **ubershaders off, GPU shaders on,
+shader JIT on** - 0 CPU-vertex draws, 36 ms frames, stutter on first sight of each render state.
+
+### Measured and NOT the cause - do not re-chase
+
+- `out of device VA for 16793600 bytes` (1700 a run): real, but a loading-time burst. The threaded
+  context replaces the whole 16 MiB vertex buffer whenever a `glBufferSubData` covers its valid range
+  while busy (`tc_improve_map_buffer_flags`), ~110 times in the first 15 s. At the failures 734 MiB were
+  LIVE and 0 MiB parked - an allocator drain-and-retry experiment proved that and was reverted. It stops
+  once loading ends; the missing 3D persisted without it.
+- Persistent-mapped stream buffers: switching to `glBufferData` changed nothing visible and cost 412
+  reallocations a frame. `glClientWaitSync` returned ALREADY_SIGNALED every time (2587 of 2587).
+
+### Left open
+
+- 52 `QueueSubmit` a frame (7027 submissions in 5 s) - something flushes mid-frame, suspected the stream
+  buffers' `glFenceSync`; draw submission is 23 ms of a 36 ms frame.
+- ~200k slow-path memory accesses a frame: dynarmic runs without fastmem (generic exception handler,
+  `host_memory.cpp` has no `__ORBIS__` arm, 16 KiB host pages vs 4 KiB guest pages).
+- Zink ignoring disabled `GL_CLIP_DISTANCEi` in core profile (above).
+- `syncobj wait timed out` thousands of times a run with nothing visibly wrong - unexplained.
