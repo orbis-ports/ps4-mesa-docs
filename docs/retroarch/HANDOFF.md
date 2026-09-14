@@ -5322,3 +5322,81 @@ shader JIT on** - 0 CPU-vertex draws, 36 ms frames, stutter on first sight of ea
   `host_memory.cpp` has no `__ORBIS__` arm, 16 KiB host pages vs 4 KiB guest pages).
 - Zink ignoring disabled `GL_CLIP_DISTANCEi` in core profile (above).
 - `syncobj wait timed out` thousands of times a run with nothing visibly wrong - unexplained.
+
+## 2026-09-14, later - Trident performance: where a frame goes, and the first 10 ms back
+
+**Where it stands (clean core, `orbis-ports/3dsTrident@836f03c`, Panda3DS `ec10c06d`):** A Link Between
+Worlds' animated title scene 20-30 fps (was ~10 at the start of the day), the field ~28-45 fps in 5 s
+windows (22-36 ms frames), with 50-250 ms windows while loading and compiling shaders. Core options on the
+console (`/data/retroarch/config/Trident/Trident.opt`): ubershaders OFF, GPU shaders ON, shader JIT ON,
+hash textures OFF - the fastest measured set.
+
+### How to measure this core - the method that worked, and the one that lied
+
+- **Count, then time.** Timing each of 200k SVCs a frame made the game 7x slower and hid what it was
+  measuring. A plain counter per SVC number found the idle spin in one run.
+- **Time scopes go through `ps4/orbis_profile.c`** (armed by the file `/data/retroarch-profile`, reports
+  every 5 s into `/data/retroarch-abort.log`). Ten slots, one name each - ⚠ two scopes on one slot sum
+  silently under whichever name wrote last; that cost a misread run (`setupBlending 8.15 ms` was a row
+  counter).
+- **GL call counts: swap glad's function pointers after `gladLoadGLLoader`** in `videoResetContext`
+  (`glad_glBufferData = wrapper`). No Mesa rebuild, per-call return addresses for free.
+- Per-frame Vulkan numbers come free from Mesa's own `BUDGET` / `per frame inside the Vulkan API` lines.
+- Instrumentation lives only in `~/.cache/ps4-cores/libretro-trident` (built with `--keep`); a clean
+  build is `rm -rf` that clone and a normal `build-cores.sh trident`, which clones the fork.
+
+### ⚠ The threaded context moves the cost to whoever SYNCS, and every conclusion here depends on it
+
+Mesa runs the gallium driver on a second thread (u_threaded_context). A GL call that needs the driver
+caught up - an upload into a texture the batch uses, a sync object, a state query - blocks the main thread
+until that thread has drained EVERYTHING queued before it. So a scope's time is not that call's cost; it
+is the backlog it happened to wait for. Measured directly: `glDrawArrays` 76 calls 57 us, `BindFramebuffer`
+147 calls 149 us - the GL calls themselves are nearly free - while `drawVertices` was 19.6 ms. Remove the
+first sync point and the time reappears at the next one (`prepareForDraw` 4.5 -> 13.7 ms after the LUT
+fix) - but the frame still got shorter, 38 -> 31 ms, because fewer syncs let the driver thread work in
+parallel. **Judge a change by frame time, never by the scope it touched.**
+
+### What was in the frame (field scene, before -> after)
+
+    frame                        38 ms  ->  27-31 ms
+    drawArrays (renderer, CPU)   24.6   ->  11.8
+      updateLightingLUT          18.4   ->   0.13     Panda3DS ec10c06d
+      prepareForDraw              4.5   ->  10.6      (absorbed syncs; see above)
+        VS UBO + vertex upload            6.9
+        FS UBO map + bind                 2.8
+    present + audio               2.3
+    QueueSubmit                  51-69 a frame, ~2.7 ms, on the driver thread
+    slow-path memory             ~200k accesses a frame (no fastmem)
+
+**The LUT fix.** `updateLightingLUT` re-uploaded the whole 24x256 RG32F LUT whenever the game touched a LUT
+register, and the game switches LUT sets between draws: ~8 genuinely different uploads a frame at ~1.7 ms
+each (each forces a sync and a zink flush). Diffing rows first did not help - the data really changes.
+Now each set seen recently has its own texture keyed by `PICAHash` of `gpu.lightingLUT` (32, LRU), so
+returning to a set is a bind. ⚠ Also fixed on the way: the upload buffer's G channel was never
+initialised, so identical LUTs never compared equal.
+
+### Measured and NOT the cost - do not re-chase
+
+- **Texture hashing** (`trident_hash_textures`): off vs on, frame time unchanged.
+- **`glFinish`, `glReadPixels`, texture copies:** zero calls a frame. `BlitFramebuffer` 4 a frame.
+- **Shader compilation in steady state:** 0 compiles a frame once a scene has been seen.
+- **`glClientWaitSync`** in the stream buffers returned ALREADY_SIGNALED every time (2587 of 2587) - its
+  2.2 ms a frame is thread sync, not GPU wait.
+
+### ⚠ Changing core options while a game runs aborts - separate, unfixed
+
+`Xbyak::Error: can't alloc` right after toggling "Run 3DS shaders on the GPU", "Use ubershaders" or "Hash
+textures" in Quick Menu, every time; the same options set in the `.opt` file before launch run fine. The
+shader-JIT arena logged nothing in those runs, so the throwing allocation is not proven to be the shader
+JIT's. Until it is understood: change Trident's options in the file (or restart content), not live.
+
+### Next, in the order agreed
+
+1. **Stream buffer sync points** - `SyncingStreamBuffer` (third_party/duckstation/gl/stream_buffer.cpp)
+   puts 16 sync objects in each buffer and calls `glFenceSync`/`glClientWaitSync` as writes cross blocks;
+   with a coherent persistent mapping on unified memory most of that is sync for nothing.
+2. Mesa disk shader cache - `shader-cache` is DISABLED in `build-orbis`; the load-time spikes are every
+   shader compiled from scratch on every launch.
+3. Vertex upload copies the whole attribute range per draw (`accelerateVertexUpload`).
+4. Fastmem for dynarmic (16 KiB host pages vs 4 KiB guest pages; exception handler).
+5. Mesa: honour disabled `GL_CLIP_DISTANCEi` in zink core profile (Trident works around it).
