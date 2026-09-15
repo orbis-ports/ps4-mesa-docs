@@ -5570,3 +5570,50 @@ compiles the pipeline variant for the draw state on its first draw, and that is 
 - `glClientWaitSync` timeouts seen in the stream buffers are not yet explained.
 - Changing core options in a running game: probably fixed with the arena leak, not re-tested one by one.
 - Mesa: zink ignores disabled `GL_CLIP_DISTANCEi` in core profile (worked around in Trident).
+
+## 2026-09-15, evening - v0.1.8 as an outside user sees it: two wrong defaults and a 97 MiB leak
+
+Release `retroarch-ps4-v0.1.8` (frontend `0914d152e5`), tested from a wiped `/data/retroarch/config`, no
+`retroarch.cfg`, no env file, cores from the Core Downloader. Core `orbis-ports/3dsTrident@402316c`
+(Panda3DS `870b745d` + the arena fix), RetroArch `274fff628c`.
+
+### melonDS DS died in `std::bad_alloc` after two other cores - Trident's shader JIT arena (Panda3DS)
+
+In one session: Trident twice, Mupen64Plus-Next, then melonDS DS - `PCap: init failed`, the microphone request,
+`terminating with uncaught exception of type std::bad_alloc`, abort. The run loop then stands still (a dying
+process idles here), which the user sees as a hang. A fresh RetroArch ran the same game.
+
+`OrbisShaderCodeAllocator` (`shader_rec_emitter_x64.cpp`, `99f69f94`) is a function-local static that takes
+256 x 388 KiB = 99,328 KiB of direct memory on first use and had no way to give it back. The core module is
+unloaded between content loads, so each Trident start took a new arena - the log shows two `99328 KiB of
+executable direct memory` lines at different addresses in one session. It now releases the arena when the last
+block comes back (every shader is freed when `Emulator` is destroyed) and in its destructor. Retested: Trident
+twice, then melonDS DS starts. ⚠ The log cannot show a release (the free path is silent and a new arena may
+land anywhere); the evidence is melonDS starting, in a sequence one core shorter than the failing one.
+
+⚠ `orbis_exec_mem.c` has 4 ownership slots. Before this fix every Trident start used one up for good.
+
+### Two defaults that were wrong on a fresh install
+
+- **Trident: ubershaders ON.** Panda3DS defaults them off only on Android and macOS. With the async compile
+  (`2af27b18`) the ubershader is just the stopgap, so `ubershaderDefault` is now false under `__ORBIS__`
+  (`870b745d`). An `.opt` saved earlier keeps its value.
+- **Mupen64Plus-Next: Angrylion.** `core-patches/mupen64plus_next/0002` made the RDP default `"parallel"` under
+  `__ORBIS__`, but this build has no ParaLLEl-RDP; a default missing from the value list makes RetroArch take the
+  first value, `angrylion`. The user measured 60 fps on it - but native resolution, no upscaling. Now
+  `"parallel"` only with `HAVE_PARALLEL_RDP`, else `gliden64`.
+
+### Recommended settings on cores.prx0.com
+
+`ps4/core-options.tsv` (core, key, label, value, why, evidence) -> `make-site.py` renders "Recommended settings"
+above the core table and links each core's row to its block. Rows so far: Trident (ubershaders OFF, hash textures
+ON, GPU shaders ON), Beetle PSX HW (the Spyro 3 set from 2026-08: dynarec, PGXP off, software framebuffer off,
+DMA invalidation, 512 event cycles, SP/GP on, 2x), Mupen64Plus-Next (GLideN64, HLE RSP). Only what this port
+changes or measured; keys checked against each core's source (Beetle HW keys are `beetle_psx_hw_*`).
+
+### Cores release: one asset at a time (`441203d214`)
+
+The first publish of the day hit GitHub's secondary rate limit three times (115 parallel uploads from
+action-gh-release) and, because R2 comes after it, left the console's copy untouched. The Release step is now a
+sequential `gh release upload --clobber` loop with backoff. ⚠ A re-run of a failed run uses the workflow file of
+the original commit - a fix to the workflow needs a new dispatch.
