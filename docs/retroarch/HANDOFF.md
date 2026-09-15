@@ -5329,7 +5329,7 @@ shader JIT on** - 0 CPU-vertex draws, 36 ms frames, stutter on first sight of ea
 Worlds' animated title scene 20-30 fps (was ~10 at the start of the day), the field ~28-45 fps in 5 s
 windows (22-36 ms frames), with 50-250 ms windows while loading and compiling shaders. Core options on the
 console (`/data/retroarch/config/Trident/Trident.opt`): ubershaders OFF, GPU shaders ON, shader JIT ON,
-hash textures OFF - the fastest measured set.
+hash textures OFF - the fastest measured set. ⚠ Superseded: hash textures must be ON (see "OoT3D text" below).
 
 ### How to measure this core - the method that worked, and the one that lied
 
@@ -5405,7 +5405,8 @@ JIT's. Until it is understood: change Trident's options in the file (or restart 
 
 **A Link Between Worlds at the first save point, same spot every run: 33 fps -> 60 fps (vsync-locked, 17.1 ms
 frames).** Core `orbis-ports/3dsTrident@9667b1f` (Panda3DS `5178fcef`), package Mesa `16b12ca41c3` - no
-Mesa change was needed. Options: ubershaders OFF, GPU shaders ON, shader JIT ON, hash textures OFF.
+Mesa change was needed. Options: ubershaders OFF, GPU shaders ON, shader JIT ON, hash textures ON (it was OFF
+for this measurement; turning it back on costs nothing measurable and OoT3D needs it - see below).
 
     save point                     start     2 syncs   page table   uint8 widen
     frame                          37.7 ms   33.2      29.7         17.1
@@ -5470,3 +5471,27 @@ the frame hand-off rather than in its own code.
   context is recreated. Not yet attributed (shader JIT vs dynarmic's code block).
 - Emulation now takes 14.9 of 16.7 ms here; heavier scenes will dip below 60.
 - Mesa: zink ignores disabled `GL_CLIP_DISTANCEi` in core profile (worked around in Trident).
+
+## 2026-09-15, later - a second game: the arena leak, and OoT3D's text needs hash textures
+
+Core `orbis-ports/3dsTrident@5ba1f11` (Panda3DS `919155fa`). Ocarina of Time 3D (a decrypted `.3ds`, loads
+without conversion) runs, and switching to it from A Link Between Worlds without restarting RetroArch works.
+
+### Switching games aborted with `Xbyak::Error: can't alloc` - a 128 MiB leak (Panda3DS `919155fa`)
+
+`Memory`'s constructor does `arena = new Common::HostMemory(...)` and there was no destructor. Without fastmem
+the arena is a `VirtualBuffer` holding the whole FCRAM plus DSP RAM, 128.5 MiB of flexible memory. Trident
+destroys and recreates `Emulator` on every content load (`retro_deinit` -> `retro_init`), so the second game
+found 128 MiB missing from a ~417 MiB flexible pool and dynarmic's code-block `mmap` failed - which is exactly
+where `can't alloc` comes from (`block_of_code.cpp`, `CustomXbyakAllocator::alloc`). Fixed by deleting the
+arena in `~Memory`. ⚠ The earlier aborts after changing core options or toggling vsync in a running game have
+the same message and are probably the same leak (RetroArch reinitialising the core); not re-tested one by one.
+
+### OoT3D's text is garbled with hash textures OFF - upstream Panda3DS #800
+
+Clean glyph shapes, wrong letters and overlapping advances ("In thneas .tqptn tpds oftn tHdyeg" for the Deku
+Tree intro). Ruled out on hardware: the dynarmic page table (a file-selected A/B with it off, same garbage).
+Upstream Panda3DS issue #800 is this exact scene; the author's answer is that it needs the "Hash textures"
+option. Turning it back on fixed it. **Keep `trident_hash_textures` enabled** - the earlier OFF recommendation
+came from a measurement where it made no difference, and it has a correctness cost.
+
