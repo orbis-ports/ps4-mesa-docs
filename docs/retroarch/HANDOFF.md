@@ -5400,3 +5400,73 @@ JIT's. Until it is understood: change Trident's options in the file (or restart 
 3. Vertex upload copies the whole attribute range per draw (`accelerateVertexUpload`).
 4. Fastmem for dynarmic (16 KiB host pages vs 4 KiB guest pages; exception handler).
 5. Mesa: honour disabled `GL_CLIP_DISTANCEi` in zink core profile (Trident works around it).
+
+## 2026-09-15 - Trident reaches 60 fps: three more fixes, and the one that mattered was an index size
+
+**A Link Between Worlds at the first save point, same spot every run: 33 fps -> 60 fps (vsync-locked, 17.1 ms
+frames).** Core `orbis-ports/3dsTrident@9667b1f` (Panda3DS `5178fcef`), package Mesa `16b12ca41c3` - no
+Mesa change was needed. Options: ubershaders OFF, GPU shaders ON, shader JIT ON, hash textures OFF.
+
+    save point                     start     2 syncs   page table   uint8 widen
+    frame                          37.7 ms   33.2      29.7         17.1
+    cpu.runFrame                   ~31                 16.3         14.9
+    videoCallback (frame hand-off)  ~2                 13.2          2.0
+    zink flushes a frame            51-86              ~85           2.5
+    guest memory callbacks a frame  ~200k              ~600          ~600
+
+### 1. Stream buffers: 2 sync points, not 16 (Panda3DS `532698ed`)
+
+Each `SyncingStreamBuffer` block boundary is a `glFenceSync` + `glClientWaitSync`, and under the threaded
+context each blocks until the driver thread drains (see the section above). A/B'd with a file-selected count:
+16 -> 37.7 ms (14.5 ms in `glClientWaitSync`), 4 -> 34, 2 -> 33.2, 1 -> 33.2. ⚠ Two measurement traps from that
+series: a window captured on a loading screen read 37-41 fps and was nearly taken as the 4-block result; and
+33.3 ms twice looked like a vsync lock, but the same number with vsync OFF proved it was real work. `#ifdef
+__ORBIS__`.
+
+### 2. dynarmic's inline page table instead of a callback per memory access (Panda3DS `c6c90420`)
+
+Fastmem was never needed. dynarmic's `UserConfig::page_table` walks a 2^20-entry table of page base pointers
+in generated code, and Panda3DS already keeps exactly that (`Memory::readTable`). Unmapped pages (MMIO, VRAM,
+config memory) are null and still take the callback, as do page-straddling accesses
+(`detect_misaligned_access_via_page_table`). No host page aliasing, no exception handler - the two things that
+made real fastmem hard on 16 KiB pages. ⚠ One table serves reads and writes, so a write to a read-only page is
+not caught; a guest doing that faults on real hardware. Callbacks 200k -> 600 a frame, `cpu.runFrame` 31 -> 16 ms.
+Not PS4-specific (applies whenever fastmem is off).
+
+### 3. ⚠ The GPU has no 8-bit index buffers, and Mesa flushed on every such draw (Panda3DS `5178fcef`)
+
+After (2) the frame was 29.7 ms with 16 ms of emulation - the other 13 ms were in `videoCallback`, the main
+thread waiting for the driver thread. Traced with three temporary Mesa censuses, each one a package build:
+
+    zink flush census    13.1k flush_batch per 5 s, from zink_flush, from batch_usage_wait
+    zink map census      READ maps of small buffers that were in the unflushed batch, from tc_buffer_map
+    u_vbuf census        rewrite_ubyte_ibs = 1; 13.2k GL_UNSIGNED_BYTE draws per 5 s rewritten on the CPU
+
+RADV exposes `KHR/EXT_index_type_uint8` only for `gfx_level >= GFX8` (`radv_physical_device.c:760, 932`), and
+Liverpool is GFX7 (`IP GFX 7.2` in radeon_info). So zink cannot take `R8_UINT` index buffers, `u_vbuf` rewrites
+every 8-bit-index draw to 16-bit, reading the index buffer back to do it - and a read of a buffer the batch still
+uses is a flush plus a wait. PICA games use 8-bit indices constantly. Panda3DS now widens them to u16 while
+uploading. Flushes 14k -> 760 per 5 s, `videoCallback` 13.2 -> 2.0 ms, **60 fps**.
+
+⚠ **This is a platform fact, not a Trident one.** Every GL core on this port that draws with
+`GL_UNSIGNED_BYTE` indices pays the same readback and flush. Worth checking any core whose frame time hides in
+the frame hand-off rather than in its own code.
+
+### How it was traced (reuse this)
+
+- `ps4/orbis_profile.c` scopes in the core put 13 ms in `videoCallback` - the core's own code was clean.
+- Mesa-side: a static table of `(__builtin_return_address(0), thread-local zink_flush caller)` counted in
+  `flush_batch`, printed every 5 s with `mesa_logi`; symbolised with `llvm-symbolizer --obj=retroarch_orbis.elf`
+  on **address - 0x400000** (the eboot's load base). Keep a copy of the ELF per package - the next build
+  overwrites it.
+- Then a census at the map site that flushed, then at `u_vbuf_draw_vbo` counting each fallback reason. All three
+  were reverted; the shipped package has none.
+
+### Still open for Trident
+
+- Shader-compile stutter on first sight of a scene - Mesa `shader-cache` is disabled in `build-orbis`; async
+  shader compilation in Panda3DS is the other half.
+- Changing core options or toggling vsync while a game runs aborts with `Xbyak::Error: can't alloc` after the GL
+  context is recreated. Not yet attributed (shader JIT vs dynarmic's code block).
+- Emulation now takes 14.9 of 16.7 ms here; heavier scenes will dip below 60.
+- Mesa: zink ignores disabled `GL_CLIP_DISTANCEi` in core profile (worked around in Trident).
