@@ -5495,3 +5495,78 @@ Upstream Panda3DS issue #800 is this exact scene; the author's answer is that it
 option. Turning it back on fixed it. **Keep `trident_hash_textures` enabled** - the earlier OFF recommendation
 came from a measurement where it made no difference, and it has a correctness cost.
 
+## 2026-09-15, afternoon - shader-compile stutter: Mesa's disk cache works, and Panda3DS compiles in the background
+
+Core `orbis-ports/3dsTrident@a23e628` (Panda3DS `2af27b18`), Mesa `mesa-ps4@a4fa6b57f8b` (release
+`orbis-mesa-a4fa6b57f8bd`), RetroArch `57cd671e61` (CI pinned in `b4bd949415`). Package on the console: `retroarch-shadercache-20260915.pkg`.
+Options unchanged: ubershaders OFF, GPU shaders ON, shader JIT ON, hash textures ON.
+
+### 1. The Mesa shader disk cache had never worked on the console - three separate failures, in order
+
+`-Dshader-cache=enabled` needs compression, so zlib now comes from Mesa's own wrap (`-Dzlib=enabled
+-Dforce_fallback_for=zlib`; never the host's). `build.sh` fetches the wrap before configure because every setup
+runs with `wrap_mode=nodownload`, and it has to unset `MESON_PACKAGE_CACHE_DIR` - the `nixpkgs#mesa` devShell
+points it at a read-only store path, which is how the first CI release run died (`PermissionError: [Errno 13]`).
+The bundle now ships `build-orbis/subprojects/zlib-1.3.1/libz.a`; `Makefile.orbis` and both link probes link it.
+
+Then, each found on hardware with a temporary log package:
+
+1. **Hang on the first frame of every GL context** - `zink_screen.c:disk_cache_init` hashes the driver's build-id
+   through `build_id_find_nhdr_for_addr`, the same `dl_iterate_phdr` walk that already killed RADV (see
+   `-Dradv-build-id`). Under `__PS4__` zink hashes `PACKAGE_VERSION MESA_GIT_SHA1` instead. ⚠ Uncommitted driver
+   changes do not change that key - clear the cache directory after testing one.
+2. **Cache silently off** - `os_get_option_secure` uses `secure_getenv`, and musl on the PS4 answers NULL for
+   every name (the process looks AT_SECURE to it). `getenv` under `__PS4__`.
+3. **Directory created, nothing ever written** - `disk_cache_mmap_cache_index` could not size the index file
+   (`posix_fallocate`/`ftruncate` fail) nor map it `MAP_SHARED`, returned false, and `disk_cache_type_create`
+   left `path_init_failed` set, so every put was dropped with no message. Under `__PS4__` the index is anonymous
+   memory (it only has to be shared between processes, and there is one), and RetroArch uses
+   `MESA_DISK_CACHE_DATABASE=1`, whose files are plain reads and writes.
+
+Measured: first A Link Between Worlds route wrote 878 KB to `mesa_shader_cache_db` (RADV's builtin cache 5.6 KB),
+a second run only 75 KB more. Stutter was less but still clearly there - which is what sent this to the census below.
+
+**Default now:** `platform_orbis.c` sets `MESA_SHADER_CACHE_DIR=/data/retroarch/shader-cache` and
+`MESA_DISK_CACHE_DATABASE=1` unless an env file already did (`MESA_SHADER_CACHE_DISABLE=1` turns it off). The old
+test directory `/data/mesa-shader-cache` and its lines in `/data/retroarch-env.txt` are gone.
+
+### 2. Where the remaining stutter came from (per-frame census, frames > 25 ms, OoT3D route)
+
+Two unrelated kinds:
+
+    renderer   frame 2037 ms: GPU command lists 1253 ms, 8 new programs     glCompileShader/glLinkProgram ~0 ms
+               frame 1045 ms:   582 ms, 12 programs;  922 ms: 605 ms, 3;  346 ms: 322 ms, 1;  168 ms: 153 ms, 2
+    emulation  frames of 1202, 794, 364, 298 ms entirely in guest ARM code; file I/O rare, once 155 ms
+
+The renderer stalls always coincide with new programs, but the GL compile/link calls cost nothing - under the
+threaded context the cost is zink building the Vulkan pipeline at the first draw, 50-150 ms a program, paid by
+whoever syncs next. The emulation stalls are dynarmic compiling new guest code (or the game's own loading); no
+shader cache touches them.
+
+⚠ A GPL census ruled out the obvious Mesa fix: on the PS4 `optimal_keys`, `EXT_graphics_pipeline_library` (fast
+linking) and `EXT_shader_object` are **all already enabled** in zink. There was no silently-disabled mode to turn on.
+
+### 3. Asynchronous programs in Panda3DS (`2af27b18`, `__ORBIS__` only)
+
+With ubershaders OFF, `prepareForDraw` links the specialized program as before but does not wait: it asks
+`GL_COMPLETION_STATUS_KHR` (0x91B1; Mesa compiles in its own queue) and draws with the ubershader until the program
+reports done, caching `ready` per program. The refactor splits `getFragmentConfig`, `getAcceleratedVertexShader`
+and `getSpecializedProgram` out of the old single path.
+
+    same OoT3D route               sync, no ubershader    ubershader ON ("B")   async
+    renderer stalls (lists >50ms)  dozens, up to 1253 ms  3, max 88 ms          11, max 282 ms
+    frames > 40 ms                 most of the slow ones  146                   51
+    speed between stalls           full                   slow (~45 ms frames)  full
+
+On the console it reads as "smooth but a bit slower, then a hitch, then native speed". The remaining 156-282 ms
+hitches land exactly when a program switches from ubershader to shadergen: the GLSL is compiled, but zink still
+compiles the pipeline variant for the draw state on its first draw, and that is waited for.
+
+### Still open for Trident
+
+- The switch-over hitch above (156-282 ms). Would need pre-warming the zink variant off the draw path; smaller
+  gain for more work.
+- Emulation stalls from dynarmic JIT on new code, up to ~1.2 s. Nothing caches this across runs.
+- `glClientWaitSync` timeouts seen in the stream buffers are not yet explained.
+- Changing core options in a running game: probably fixed with the arena leak, not re-tested one by one.
+- Mesa: zink ignores disabled `GL_CLIP_DISTANCEi` in core profile (worked around in Trident).
