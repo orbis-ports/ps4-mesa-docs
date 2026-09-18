@@ -152,11 +152,7 @@ its own comment says *"presence, not meaning"* — and refusing the combination 
    three, and the script is in the bundle, so everyone gets it.
 3. **Mesa's `manifest.txt` should record the include/ hash**, so `verify` checks the pairing itself
    instead of trusting a verdict carried from the cut.
-4. **One message to OpenOrbis.** It settles `crtlib.c`'s licence, the stubs, and whether the private
-   BSD-libc toolchain can be seen. Material is drafted at `scratchpad/outreach/` — situation with
-   quotes and dates, what we bring, ranked questions, a message to paste, and a risk note.
-   ⚠ That directory is a scratchpad and does not survive; copy it somewhere real before relying on it.
-5. **`PLAN.md` items 10-12**, added today: the env-file list that names its consumers, the `ORBIS_*`
+4. **`PLAN.md` items 10-12**, added today: the env-file list that names its consumers, the `ORBIS_*`
    switches that could not be set on a console, and `crtlib.o`'s remaining licence question.
 
 ---
